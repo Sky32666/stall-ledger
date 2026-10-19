@@ -78,8 +78,8 @@ CREATE TABLE IF NOT EXISTS ledger_moves (
   item_name  TEXT NOT NULL,
   unit       TEXT NOT NULL,
   outlet_id  TEXT NOT NULL,
-  type       TEXT NOT NULL CHECK (type IN ('in', 'count', 'waste')),
-  qty        NUMERIC NOT NULL,                     -- in/waste: amount; count: amount used (before - after)
+  type       TEXT NOT NULL,                        -- in | count | waste | sale (see constraint below)
+  qty        NUMERIC NOT NULL,                     -- in/waste/sale: amount; count: amount used (before - after)
   before     NUMERIC NOT NULL,
   after      NUMERIC NOT NULL,
   cost       INTEGER NOT NULL DEFAULT 0,           -- cents, stock-in only
@@ -91,6 +91,22 @@ CREATE TABLE IF NOT EXISTS ledger_moves (
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_moves_date ON ledger_moves (date DESC);
 CREATE INDEX IF NOT EXISTS idx_ledger_moves_created ON ledger_moves (created_at DESC);
+
+-- 'sale' moves are written automatically from a day's items sold (via recipes).
+-- closing_id ties them to that day so re-saving the day only applies the difference.
+ALTER TABLE ledger_moves ADD COLUMN IF NOT EXISTS closing_id TEXT;
+ALTER TABLE ledger_moves DROP CONSTRAINT IF EXISTS ledger_moves_type_check;
+ALTER TABLE ledger_moves ADD CONSTRAINT ledger_moves_type_check CHECK (type IN ('in', 'count', 'waste', 'sale'));
+CREATE INDEX IF NOT EXISTS idx_ledger_moves_closing ON ledger_moves (closing_id) WHERE closing_id IS NOT NULL;
+
+-- What one portion of each dish uses from stock.
+-- dish = lower-cased dish name, matched against items_sold names.
+CREATE TABLE IF NOT EXISTS ledger_recipes (
+  dish       TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,                        -- display name
+  lines      JSONB NOT NULL DEFAULT '[]'::jsonb,   -- [{item_id, qty}] per portion, in the item's unit
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 -- One row per stall per month; id = '<YYYY-MM>_<outlet>'
 CREATE TABLE IF NOT EXISTS ledger_expenses (
@@ -108,7 +124,7 @@ CREATE INDEX IF NOT EXISTS idx_ledger_expenses_month ON ledger_expenses (month);
 DO $$
 DECLARE t TEXT;
 BEGIN
-  FOREACH t IN ARRAY ARRAY['ledger_settings','ledger_closings','ledger_items','ledger_moves','ledger_expenses'] LOOP
+  FOREACH t IN ARRAY ARRAY['ledger_settings','ledger_closings','ledger_items','ledger_moves','ledger_expenses','ledger_recipes'] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
     EXECUTE format('DROP POLICY IF EXISTS %I ON %I', t || '_members', t);
     EXECUTE format(
@@ -162,6 +178,70 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION ledger_record_move(UUID, TEXT, TEXT, NUMERIC, INTEGER, TEXT, TEXT, DATE) TO authenticated;
+
+-- ── Deduct stock for a day's items sold ──────────────────────────────────────
+-- Works out what the day's sales should have used (items_sold × recipes),
+-- compares it with the 'sale' moves already written for that day, and writes
+-- only the difference. Safe to call after every save of the day: saving 25
+-- Chicken Chop after first saving 23 deducts 2 more; removing a dish puts its
+-- stock back. Returns one row per stock item it changed.
+CREATE OR REPLACE FUNCTION ledger_apply_sales(p_closing_id TEXT)
+RETURNS TABLE (o_item_name TEXT, o_unit TEXT, o_change NUMERIC, o_after NUMERIC)
+LANGUAGE plpgsql
+SECURITY INVOKER
+AS $$
+#variable_conflict use_column
+DECLARE
+  c        ledger_closings;
+  r        RECORD;
+  it       ledger_items;
+  v_before NUMERIC;
+  v_after  NUMERIC;
+BEGIN
+  SELECT * INTO c FROM ledger_closings WHERE id = p_closing_id;
+  IF NOT FOUND THEN RAISE EXCEPTION 'day not found'; END IF;
+
+  FOR r IN
+    WITH sold AS (
+      SELECT lower(trim(s ->> 'name')) AS dish, coalesce((s ->> 'qty')::numeric, 0) AS qty
+      FROM jsonb_array_elements(c.items_sold) AS s
+    ), needed AS (
+      SELECT (l ->> 'item_id')::uuid AS item, sum(sold.qty * (l ->> 'qty')::numeric) AS qty
+      FROM sold
+      JOIN ledger_recipes rc ON rc.dish = sold.dish
+      CROSS JOIN LATERAL jsonb_array_elements(rc.lines) AS l
+      GROUP BY 1
+    ), applied AS (
+      SELECT m.item_id AS item, sum(m.qty) AS qty
+      FROM ledger_moves m
+      WHERE m.closing_id = p_closing_id AND m.type = 'sale'
+      GROUP BY 1
+    )
+    SELECT coalesce(n.item, a.item) AS item, round(coalesce(n.qty, 0) - coalesce(a.qty, 0), 2) AS delta
+    FROM needed n
+    FULL JOIN applied a ON a.item = n.item
+  LOOP
+    CONTINUE WHEN r.delta IS NULL OR r.delta = 0;
+    SELECT * INTO it FROM ledger_items WHERE id = r.item FOR UPDATE;
+    CONTINUE WHEN NOT FOUND;
+
+    v_before := coalesce((it.qty ->> c.outlet_id)::numeric, 0);
+    v_after  := round(v_before - r.delta, 2);
+
+    INSERT INTO ledger_moves (item_id, item_name, unit, outlet_id, type, qty, before, after, cost, note, date, closing_id)
+    VALUES (it.id, it.name, it.unit, c.outlet_id, 'sale', r.delta, v_before, v_after, 0,
+            CASE WHEN r.delta > 0 THEN 'Sold on ' ELSE 'Correction for ' END || to_char(c.date, 'DD Mon'),
+            c.date, p_closing_id);
+
+    UPDATE ledger_items SET qty = qty || jsonb_build_object(c.outlet_id, v_after) WHERE id = it.id;
+
+    o_item_name := it.name; o_unit := it.unit; o_change := -r.delta; o_after := v_after;
+    RETURN NEXT;
+  END LOOP;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION ledger_apply_sales(TEXT) TO authenticated;
 
 -- ── Photo storage: private bucket, members only ─────────────────────────────
 INSERT INTO storage.buckets (id, name, public)

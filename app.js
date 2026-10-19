@@ -38,7 +38,7 @@
   }
 
   const PAY = [['cash', 'Cash'], ['card', 'NETS/card'], ['paynow', 'PayNow/QR'], ['delivery', 'Delivery apps'], ['other', 'Other']];
-  const MOVE_TYPES = { in: 'Stock in', count: 'Count', waste: 'Write-off' };
+  const MOVE_TYPES = { in: 'Stock in', count: 'Count', waste: 'Write-off', sale: 'Sold' };
 
   // ── data layer (Supabase) ──────────────────────────────────────────────
   const fromClosing = (r) => ({
@@ -46,7 +46,8 @@
     note: r.note, photoPath: r.photo_path, sold: Array.isArray(r.items_sold) ? r.items_sold : [],
   });
   const fromItem = (r) => ({ id: r.id, name: r.name, unit: r.unit, category: r.category, low: r.low == null ? null : Number(r.low), qty: r.qty || {}, active: r.active });
-  const fromMove = (r) => ({ id: r.id, itemId: r.item_id, itemName: r.item_name, unit: r.unit, outletId: r.outlet_id, type: r.type, qty: Number(r.qty), before: Number(r.before), after: Number(r.after), cost: r.cost, supplier: r.supplier, note: r.note, date: r.date, createdAt: r.created_at });
+  const fromMove = (r) => ({ id: r.id, itemId: r.item_id, itemName: r.item_name, unit: r.unit, outletId: r.outlet_id, type: r.type, qty: Number(r.qty), before: Number(r.before), after: Number(r.after), cost: r.cost, supplier: r.supplier, note: r.note, date: r.date, createdAt: r.created_at, closingId: r.closing_id });
+  const fromRecipe = (r) => ({ dish: r.dish, name: r.name, lines: Array.isArray(r.lines) ? r.lines : [] });
   const fromExpense = (r) => ({ id: r.id, month: r.month, outletId: r.outlet_id, lines: r.lines || {}, note: r.note });
   const must = ({ data, error }) => { if (error) throw error; return data; };
 
@@ -61,6 +62,14 @@
       }));
     },
     async items() { return must(await sb.from('ledger_items').select('*').order('name')).map(fromItem); },
+    async recipes() { return must(await sb.from('ledger_recipes').select('*').order('name')).map(fromRecipe); },
+    async saveRecipe(r) { must(await sb.from('ledger_recipes').upsert({ dish: r.dish, name: r.name, lines: r.lines, updated_at: new Date().toISOString() })); },
+    async deleteRecipe(dish) { must(await sb.from('ledger_recipes').delete().eq('dish', dish)); },
+    // Takes the day's items sold off stock using the recipes; only applies changes since the last save
+    async applySales(closingId) {
+      return must(await sb.rpc('ledger_apply_sales', { p_closing_id: closingId }))
+        .map(r => ({ name: r.o_item_name, unit: r.o_unit, change: Number(r.o_change), after: Number(r.o_after) }));
+    },
     async addItem(it) { must(await sb.from('ledger_items').insert(it)); },
     async updateItem(id, patch) { must(await sb.from('ledger_items').update(patch).eq('id', id)); },
     async moves() { return must(await sb.from('ledger_moves').select('*').order('created_at', { ascending: false }).limit(300)).map(fromMove); },
@@ -99,7 +108,7 @@
   const S = {
     outlets: [{ id: 'a', name: 'Stall 1' }],
     outlet: lsGet('ledger.outlet', 'a'),
-    closings: [], items: [], moves: [],
+    closings: [], items: [], moves: [], recipes: [],
     photoBlob: null, photoPath: null, photoUploading: null,
     photoUrls: {},
     sold: [],   // items sold on the day being edited: [{name, qty, amount(cents)}]
@@ -147,10 +156,10 @@
     if (refreshing) return refreshing;
     refreshing = (async () => {
       try {
-        const [settings, closings, items, moves] = await Promise.all([api.settings(), api.closings(), api.items(), api.moves()]);
+        const [settings, closings, items, moves, recipes] = await Promise.all([api.settings(), api.closings(), api.items(), api.moves(), api.recipes()]);
         if (Array.isArray(settings?.outlets) && settings.outlets.length) S.outlets = settings.outlets.map(o => ({ id: String(o.id), name: String(o.name) }));
-        S.closings = closings; S.items = items; S.moves = moves;
-        renderOutlets(); renderClose(); renderStock(); renderDishList();
+        S.closings = closings; S.items = items; S.moves = moves; S.recipes = recipes;
+        renderOutlets(); renderClose(); renderStock(); renderDishList(); renderRecipes();
         if (!$('tab-report').hidden) loadReport();
         $('statusNote').innerHTML = '';
       } catch (e) {
@@ -302,7 +311,7 @@
     $('saveClose').textContent = ex ? 'Update this day' : 'Save this day';
     renderRecent();
   }
-  $('closeDate').addEventListener('change', () => { const ex = existingClose(); if (ex) fillForm(ex); renderClose(); });
+  $('closeDate').addEventListener('change', () => { $('saleNote').innerHTML = ''; const ex = existingClose(); if (ex) fillForm(ex); renderClose(); });
 
   async function renderRecent() {
     const rows = S.closings.filter(c => c.outletId === S.outlet).slice(0, 14);
@@ -333,7 +342,7 @@
     if (e.target.closest('[data-photo]')) return; // open the photo instead
     const it = e.target.closest('.it'); if (!it) return;
     const c = S.closings.find(x => x.id === it.dataset.id); if (!c) return;
-    $('closeDate').value = c.date; fillForm(c); renderClose(); window.scrollTo(0, 0);
+    $('closeDate').value = c.date; $('saleNote').innerHTML = ''; fillForm(c); renderClose(); window.scrollTo(0, 0);
     toast('Loaded. Edit and save again to update.');
   });
 
@@ -452,14 +461,16 @@
       const pay = {};
       for (const [k] of PAY) { const v = toCents(F[k].value); if (v) pay[k] = v; }
       const orders = parseInt(F.orders.value, 10);
+      const id = closeId();
       await api.saveClosing({
-        id: closeId(), date, outletId: S.outlet, total, pay,
+        id, date, outletId: S.outlet, total, pay,
         orders: Number.isFinite(orders) ? orders : null,
         note: F.note.value.trim().slice(0, 200),
         photoPath: S.photoPath || prev?.photoPath || null,
         sold,
       });
       toast(`${outletName(S.outlet)} ${fmtDay(date)} saved: ${money(total)}`);
+      await showStockUpdate(id, sold, prev);
       S.photoBlob = null; S.photoPath = null; S.photoUploading = null; ocrRun++;
       $('photoPrev').hidden = true; $('aiNote').innerHTML = ''; $('photoHint').textContent = 'Take a photo of the POS end-of-day report. The phone reads the numbers for you.';
       fillForm(null);
@@ -470,6 +481,29 @@
       btn.disabled = false; renderClose();
     }
   });
+
+  // Take the day's sales off stock and say what changed
+  async function showStockUpdate(closingId, sold, prev) {
+    const el = $('saleNote');
+    const hadSales = sold.length || prev?.sold?.length;
+    if (!hadSales) { el.innerHTML = ''; return; }
+    const known = new Set(S.recipes.map(r => r.dish));
+    const noRecipe = sold.filter(it => it.qty > 0 && !known.has(it.name.trim().toLowerCase())).map(it => it.name);
+    const missing = noRecipe.length
+      ? `<div class="note warn">No recipe yet for ${noRecipe.map(esc).join(', ')}, so ${noRecipe.length === 1 ? 'it was' : 'they were'} not taken off stock. <button class="btn small" type="button" data-go-recipes>Set up recipes</button></div>`
+      : '';
+    try {
+      const changes = await api.applySales(closingId);
+      const lines = changes.map(c => `${esc(c.name)} ${c.change < 0 ? '−' : '+'}${qtyFmt(Math.abs(c.change))} ${esc(c.unit)} <span class="muted">(now ${qtyFmt(c.after)})</span>`);
+      el.innerHTML = (lines.length
+        ? `<div class="note info"><b>Stock updated from sales:</b><br>${lines.join('<br>')}</div>`
+        : (S.recipes.length && sold.length && !noRecipe.length ? `<div class="note info">Stock already matches this day’s sales.</div>` : '')) + missing;
+    } catch (e) {
+      console.error(e);
+      el.innerHTML = `<div class="note warn">The day was saved, but stock could not be updated from sales. Save the day again to retry.</div>`;
+    }
+    el.querySelector('[data-go-recipes]')?.addEventListener('click', () => { showTab('stock'); $('recipeList').scrollIntoView({ block: 'center' }); });
+  }
 
   // ── stock ──────────────────────────────────────────────────────────────
   const qtyOf = (it, outletId = S.outlet) => Number(it.qty?.[outletId] || 0);
@@ -503,13 +537,104 @@
     const moves = S.moves.filter(m => m.outletId === S.outlet).slice(0, 20);
     $('moveList').innerHTML = moves.length ? moves.map(m => `
       <div class="it">
-        <span class="pill ${m.type === 'in' ? 'ok' : m.type === 'waste' ? 'out' : ''}">${MOVE_TYPES[m.type] || m.type}</span>
+        <span class="pill ${m.type === 'in' ? 'ok' : m.type === 'waste' ? 'out' : m.type === 'sale' ? 'low' : ''}">${MOVE_TYPES[m.type] || m.type}</span>
         <div class="main"><div class="title">${esc(m.itemName)}</div>
           <div class="muted">${fmtDay(m.date)}${m.supplier ? ' · ' + esc(m.supplier) : ''}${m.note ? ' · ' + esc(m.note) : ''}</div></div>
-        <div class="amt">${m.type === 'count' ? qtyFmt(m.after) + ' left' : (m.type === 'in' ? '+' : '−') + qtyFmt(m.qty)} ${esc(m.unit)}${m.cost ? '<div class="muted">' + money(m.cost) + '</div>' : ''}</div>
+        <div class="amt">${m.type === 'count' ? qtyFmt(m.after) + ' left' : (m.type === 'in' || m.qty < 0 ? '+' : '−') + qtyFmt(Math.abs(m.qty))} ${esc(m.unit)}${m.cost ? '<div class="muted">' + money(m.cost) + '</div>' : ''}</div>
       </div>`).join('') : `<div class="empty">Stock-ins, counts and write-offs show up here.</div>`;
   }
   $('stockSearch').addEventListener('input', renderStock);
+
+  // ── recipes ────────────────────────────────────────────────────────────
+  const itemById = (id) => S.items.find(i => i.id === id);
+  const recipeText = (r) => r.lines.map(l => {
+    const it = itemById(l.item_id);
+    return it ? `${qtyFmt(l.qty)} ${esc(it.unit)} ${esc(it.name)}` : null;
+  }).filter(Boolean).join(', ');
+
+  function renderRecipes() {
+    const byDish = new Map(S.recipes.map(r => [r.dish, r]));
+    // Dishes sold recently that have no recipe yet
+    const sold = new Map();
+    for (const c of S.closings.slice(0, 60)) for (const it of c.sold) {
+      const k = String(it.name).trim().toLowerCase();
+      if (k && !byDish.has(k) && !sold.has(k)) sold.set(k, it.name);
+    }
+    const rows = [
+      ...S.recipes.map(r => `<div class="it clickable" data-dish="${esc(r.dish)}">
+        <div class="main"><div class="title">${esc(r.name)}</div><div class="muted">${recipeText(r) || 'No ingredients set'}</div></div>
+        <span class="pill ok">Set</span></div>`),
+      ...[...sold.values()].map(n => `<div class="it clickable" data-new="${esc(n)}">
+        <div class="main"><div class="title">${esc(n)}</div><div class="muted">Sold recently · not taken off stock yet</div></div>
+        <span class="pill low">No recipe</span></div>`),
+    ];
+    $('recipeList').innerHTML = rows.length ? rows.join('')
+      : `<div class="empty">${S.items.length ? 'No recipes yet. Tap “+ New recipe”, e.g. Chicken Chop uses 1 pcs chicken chop and 0.15 kg fries.' : 'Add your stock items first, then set what each dish uses.'}</div>`;
+  }
+  $('recipeList').addEventListener('click', e => {
+    const it = e.target.closest('.it'); if (!it) return;
+    if (it.dataset.dish) editRecipe(S.recipes.find(r => r.dish === it.dataset.dish));
+    else editRecipe(null, it.dataset.new);
+  });
+  $('addRecipe').addEventListener('click', () => editRecipe(null));
+
+  function editRecipe(recipe, presetName = '') {
+    const items = S.items.filter(i => i.active !== false);
+    if (!items.length) { toast('Add stock items first, then set recipes'); return; }
+    let lines = recipe ? recipe.lines.map(l => ({ ...l })) : [{ item_id: items[0].id, qty: 1 }];
+    const options = (sel) => items.map(i => `<option value="${esc(i.id)}" ${i.id === sel ? 'selected' : ''}>${esc(i.name)} (${esc(i.unit)})</option>`).join('');
+    openSheet(`
+      <div class="row"><h2 class="grow">${recipe ? 'Edit recipe' : 'New recipe'}</h2><button class="btn small" data-close type="button">Close</button></div>
+      <label class="f">Dish name (as on the Z report)<input id="rc-name" maxlength="40" list="dish-list" value="${esc(recipe?.name || presetName)}" placeholder="e.g. Chicken Chop"></label>
+      <div class="muted">One portion uses:</div>
+      <div id="rc-lines" style="display:flex;flex-direction:column;gap:8px"></div>
+      <button class="btn small" id="rc-add" type="button" style="align-self:flex-start">+ Add ingredient</button>
+      <button class="btn primary block" id="rc-save" type="button">Save recipe</button>
+      ${recipe ? `<button class="btn block danger" id="rc-del" type="button">Delete recipe</button>` : ''}
+      <div class="muted">Only main ingredients are worth tracking, e.g. meat, fries, pasta, boxes.</div>
+    `, (el, close) => {
+      const draw = () => {
+        el.querySelector('#rc-lines').innerHTML = lines.map((l, i) => `
+          <div class="recipe-line" data-i="${i}">
+            <select id="rc-item-${i}" data-f="item" aria-label="Stock item">${options(l.item_id)}</select>
+            <input id="rc-qty-${i}" data-f="qty" class="money" inputmode="decimal" value="${l.qty ?? ''}" placeholder="1" aria-label="Quantity per portion">
+            <button class="icon-btn" data-remove type="button" aria-label="Remove ingredient">×</button>
+          </div>`).join('') || `<div class="muted">No ingredients. Add at least one.</div>`;
+      };
+      draw();
+      el.querySelector('#rc-lines').addEventListener('input', e => {
+        const row = e.target.closest('.recipe-line'); if (!row) return;
+        const l = lines[+row.dataset.i];
+        if (e.target.dataset.f === 'item') l.item_id = e.target.value;
+        else l.qty = parseFloat(e.target.value);
+      });
+      el.querySelector('#rc-lines').addEventListener('change', e => {
+        const row = e.target.closest('.recipe-line'); if (row && e.target.dataset.f === 'item') lines[+row.dataset.i].item_id = e.target.value;
+      });
+      el.querySelector('#rc-lines').addEventListener('click', e => {
+        if (!e.target.closest('[data-remove]')) return;
+        lines.splice(+e.target.closest('.recipe-line').dataset.i, 1); draw();
+      });
+      el.querySelector('#rc-add').onclick = () => { lines.push({ item_id: items[0].id, qty: 1 }); draw(); };
+      el.querySelector('#rc-save').onclick = async () => {
+        const name = el.querySelector('#rc-name').value.trim();
+        if (!name) return toast('Enter the dish name');
+        const clean = lines.filter(l => l.item_id && Number.isFinite(l.qty) && l.qty > 0).map(l => ({ item_id: l.item_id, qty: Math.round(l.qty * 1000) / 1000 }));
+        if (!clean.length) return toast('Add at least one ingredient with a quantity');
+        const dish = name.toLowerCase();
+        try {
+          if (recipe && recipe.dish !== dish) await api.deleteRecipe(recipe.dish); // renamed
+          await api.saveRecipe({ dish, name, lines: clean });
+          close(); toast(`Recipe saved. From now on, selling ${name} takes it off stock.`); refreshAll();
+        } catch (e) { console.error(e); toast('Could not save the recipe'); }
+      };
+      const del = el.querySelector('#rc-del');
+      if (del) del.onclick = async () => {
+        if (del.dataset.armed !== '1') { del.dataset.armed = '1'; del.textContent = 'Tap again to delete (stock already taken off stays)'; return; }
+        try { await api.deleteRecipe(recipe.dish); close(); toast('Recipe deleted'); refreshAll(); } catch { toast('Could not delete'); }
+      };
+    });
+  }
 
   function openSheet(html, onMount) {
     const bg = document.createElement('div');
@@ -595,7 +720,7 @@
         const q = parseFloat(qInp.value); const cur = qtyOf(item);
         if (!Number.isFinite(q)) { el.querySelector('#mv-preview').textContent = ''; return; }
         const after = type === 'in' ? cur + q : type === 'waste' ? cur - q : q;
-        const extra = type === 'count' ? ` (${after <= cur ? 'used' : 'extra'} ${qtyFmt(Math.abs(cur - after))} ${item.unit})` : '';
+        const extra = type === 'count' && after !== cur ? ` (${after < cur ? 'short by' : 'over by'} ${qtyFmt(Math.abs(cur - after))} ${item.unit} vs the system)` : '';
         el.querySelector('#mv-preview').textContent = `After saving: ${qtyFmt(after)} ${item.unit}${extra}`;
       };
       qInp.addEventListener('input', preview);

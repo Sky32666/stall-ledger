@@ -28,6 +28,8 @@ img { max-width: 100%; }
 .sold-nums { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto; gap: 8px; align-items: center; }
 .sold-nums label { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); min-width: 0; }
 .icon-btn { background: none; border: 0; color: var(--muted); font-size: 20px; cursor: pointer; padding: 4px; line-height: 1; }
+.recipe-line { display: grid; grid-template-columns: minmax(0, 1fr) 5.5em auto; gap: 8px; align-items: center; }
+.recipe-line select { padding: 9px 8px; }
 .ocr-raw { font-family: var(--font-num); font-size: 12px; white-space: pre-wrap; max-height: 200px; overflow: auto; background: var(--surface-2); border-radius: 8px; padding: 8px; }
 /* Layout: one phone-width column; sticky stall switcher on top, tab bar fixed at the bottom like a hawker's phone app. */
 :root {
@@ -268,6 +270,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
         <label class="f">Note<input id="f-note" placeholder="e.g. rainy day, 2 meals on the house"></label>
         <div id="overwriteNote"></div>
         <button class="btn primary block" id="saveClose">Save this day</button>
+        <div id="saleNote"></div>
       </div>
 
       <div class="card">
@@ -286,6 +289,11 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
       <div class="card">
         <input id="stockSearch" type="search" placeholder="Search items…" aria-label="Search items">
         <div class="list" id="stockList"><div class="empty">No stock items yet. Tap “+ New item” to add chicken chops, fries, pasta and other main ingredients.</div></div>
+      </div>
+      <div class="card">
+        <div class="row"><h3 class="grow">Recipes</h3><button class="btn small" id="addRecipe" type="button">+ New recipe</button></div>
+        <div class="muted">What one portion of each dish uses. When you save a day’s items sold, these are taken off stock automatically.</div>
+        <div class="list" id="recipeList"></div>
       </div>
       <div class="card">
         <h3>Recent movements</h3>

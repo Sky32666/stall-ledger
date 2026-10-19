@@ -1,6 +1,6 @@
 // Offline shell: the app's own files load even without signal; data still
 // needs the network. Network-first so a new deploy shows up on next open.
-const CACHE = 'ledger-shell-v2';
+const CACHE = 'ledger-shell-v3';
 const SHELL = ['./', 'index.html', 'app.js', 'ocr.js', 'config.js', 'manifest.webmanifest', 'icons/icon-192.png'];
 
 self.addEventListener('install', (e) => {
