@@ -1,19 +1,30 @@
 -- ─────────────────────────────────────────────────────────────────────────────
--- Stall Ledger: daily closings, item sales, stock, monthly P&L.
--- Separate from the POS tables (all prefixed ledger_). Only signed-in users
--- whose email is in ledger_members can read or write anything.
+-- Stall Ledger: daily closings, item sales, recipes, stock, monthly P&L.
+-- Separate from the POS tables (all prefixed ledger_).
+--
+-- Access: anyone can create an account in the app, but only members can read
+-- or write ledger data. A new account asks to join (ledger_join_requests) and
+-- an owner approves it in the app's Settings → People.
 --
 -- Run in Supabase → SQL Editor. Safe to run again after updates (every
--- statement is idempotent). Then add each person:
---   1. Authentication → Users → Add user (email + password, auto-confirm)
---   2. insert into ledger_members (email) values ('sister@example.com');
+-- statement is idempotent). Then make yourself the first owner:
+--   insert into ledger_members (email, role) values ('you@example.com', 'owner')
+--   on conflict (email) do update set role = 'owner';
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- ── Members (allow-list) ─────────────────────────────────────────────────────
+-- ── Members and owners ───────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS ledger_members (
   email      TEXT PRIMARY KEY,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE ledger_members ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'staff';
+ALTER TABLE ledger_members DROP CONSTRAINT IF EXISTS ledger_members_role_check;
+ALTER TABLE ledger_members ADD CONSTRAINT ledger_members_role_check CHECK (role IN ('owner', 'staff'));
+
+CREATE OR REPLACE FUNCTION ledger_my_email()
+RETURNS TEXT LANGUAGE sql STABLE AS $$
+  SELECT lower(coalesce(auth.jwt() ->> 'email', ''));
+$$;
 
 CREATE OR REPLACE FUNCTION is_ledger_member()
 RETURNS BOOLEAN
@@ -22,20 +33,102 @@ STABLE
 SECURITY DEFINER
 SET search_path = public
 AS $$
-  SELECT EXISTS (
-    SELECT 1 FROM ledger_members
-    WHERE lower(email) = lower(coalesce(auth.jwt() ->> 'email', ''))
-  );
+  SELECT EXISTS (SELECT 1 FROM ledger_members WHERE lower(email) = ledger_my_email());
+$$;
+
+CREATE OR REPLACE FUNCTION is_ledger_owner()
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (SELECT 1 FROM ledger_members WHERE lower(email) = ledger_my_email() AND role = 'owner');
 $$;
 
 REVOKE ALL ON FUNCTION is_ledger_member() FROM public;
+REVOKE ALL ON FUNCTION is_ledger_owner() FROM public;
 GRANT EXECUTE ON FUNCTION is_ledger_member() TO authenticated;
+GRANT EXECUTE ON FUNCTION is_ledger_owner() TO authenticated;
 
+-- Members see their own row; owners see everyone. Changes go through the
+-- functions below, so there are no insert/update/delete policies.
 ALTER TABLE ledger_members ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS ledger_members_self ON ledger_members;
 CREATE POLICY ledger_members_self ON ledger_members
   FOR SELECT TO authenticated
-  USING (lower(email) = lower(coalesce(auth.jwt() ->> 'email', '')));
+  USING (lower(email) = ledger_my_email() OR is_ledger_owner());
+
+-- ── Join requests (new accounts waiting for approval) ────────────────────────
+CREATE TABLE IF NOT EXISTS ledger_join_requests (
+  email      TEXT PRIMARY KEY,
+  name       TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE ledger_join_requests ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS ledger_join_requests_read ON ledger_join_requests;
+CREATE POLICY ledger_join_requests_read ON ledger_join_requests
+  FOR SELECT TO authenticated
+  USING (lower(email) = ledger_my_email() OR is_ledger_owner());
+
+-- Signed-in, not-yet-member user asks to join (their own email only)
+CREATE OR REPLACE FUNCTION ledger_request_access(p_name TEXT)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF ledger_my_email() = '' THEN RAISE EXCEPTION 'not signed in'; END IF;
+  IF is_ledger_member() THEN RETURN; END IF;
+  INSERT INTO ledger_join_requests (email, name)
+  VALUES (ledger_my_email(), nullif(left(trim(coalesce(p_name, '')), 60), ''))
+  ON CONFLICT (email) DO UPDATE SET name = coalesce(EXCLUDED.name, ledger_join_requests.name);
+END;
+$$;
+
+-- Owner approves (as staff) or declines a request
+CREATE OR REPLACE FUNCTION ledger_decide_request(p_email TEXT, p_approve BOOLEAN)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF NOT is_ledger_owner() THEN RAISE EXCEPTION 'only an owner can do this'; END IF;
+  IF p_approve THEN
+    INSERT INTO ledger_members (email, role) VALUES (lower(p_email), 'staff') ON CONFLICT (email) DO NOTHING;
+  END IF;
+  DELETE FROM ledger_join_requests WHERE lower(email) = lower(p_email);
+END;
+$$;
+
+-- Owner removes a member or changes their role; owners cannot demote or remove themselves
+CREATE OR REPLACE FUNCTION ledger_set_member(p_email TEXT, p_role TEXT)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF NOT is_ledger_owner() THEN RAISE EXCEPTION 'only an owner can do this'; END IF;
+  IF lower(p_email) = ledger_my_email() THEN RAISE EXCEPTION 'you cannot change your own access'; END IF;
+  IF p_role IS NULL THEN
+    DELETE FROM ledger_members WHERE lower(email) = lower(p_email);
+  ELSIF p_role IN ('owner', 'staff') THEN
+    UPDATE ledger_members SET role = p_role WHERE lower(email) = lower(p_email);
+  ELSE
+    RAISE EXCEPTION 'bad role %', p_role;
+  END IF;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION ledger_request_access(TEXT) FROM public;
+REVOKE ALL ON FUNCTION ledger_decide_request(TEXT, BOOLEAN) FROM public;
+REVOKE ALL ON FUNCTION ledger_set_member(TEXT, TEXT) FROM public;
+GRANT EXECUTE ON FUNCTION ledger_request_access(TEXT) TO authenticated;
+GRANT EXECUTE ON FUNCTION ledger_decide_request(TEXT, BOOLEAN) TO authenticated;
+GRANT EXECUTE ON FUNCTION ledger_set_member(TEXT, TEXT) TO authenticated;
 
 -- ── Data tables ──────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS ledger_settings (

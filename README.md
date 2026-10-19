@@ -8,17 +8,22 @@ A phone-first web app for a hawker stall: daily close, item sales, stock and a m
 - **Recipes**: set what one portion of each dish uses (e.g. Chicken Chop = 1 pcs chicken chop + 0.15 kg fries). When a day's items sold are saved, those ingredients come off stock automatically. Editing and re-saving a day only applies the difference, so nothing is taken off twice. When you count stock, any gap from the system figure is real loss (waste, portions, theft).
 - **Report**: sales − food purchases = gross profit, minus rent, wages, utilities and other expenses = net profit. Also item sales ranking, daily sales, best days of the week, payment mix and purchases by supplier. Export to CSV for Excel or the accountant.
 
-Data is stored in Supabase in tables prefixed `ledger_`, separate from the POS tables. Only emails on the allow-list can sign in and see anything.
+Data is stored in Supabase in tables prefixed `ledger_`, separate from the POS tables. Anyone can create an account, but only approved members can see or change anything. A new account waits on an approval screen until an owner approves it in **Settings → People**.
 
 ## One-time setup (Supabase)
 
 1. **Create the tables**: Supabase → SQL Editor → paste all of [`supabase/migrations/20261021_stall_ledger.sql`](supabase/migrations/20261021_stall_ledger.sql) → Run. The script is safe to run again after an update.
-2. **Turn off public sign-up**: Authentication → Sign In / Providers → Email → turn off *Allow new users to sign up*. (Even if left on, people not on the allow-list see no data.)
-3. **Add a user**: Authentication → Users → *Add user* → *Create new user*, enter email and password, tick *Auto Confirm User*.
-4. **Add them to the allow-list**: in SQL Editor run
+2. **Make yourself the owner**: create your account on the site first (or in Authentication → Users), then run in SQL Editor:
    ```sql
-   insert into ledger_members (email) values ('sister@example.com');
+   insert into ledger_members (email, role) values ('you@example.com', 'owner')
+   on conflict (email) do update set role = 'owner';
    ```
+3. **Point confirmation emails at the site**: Authentication → URL Configuration → set *Site URL* to `https://sky32666.github.io/stall-ledger/` and add the same address under *Redirect URLs*. Otherwise the link in the sign-up email opens `localhost`.
+4. Leave Authentication → Sign In / Providers → Email → *Allow new users to sign up* **on**, and *Confirm email* **on** (people must prove they own the email).
+
+After that, staff sign themselves up on the site and you approve them under Settings → People.
+
+> This Supabase project also holds the POS tables. With sign-up open, anyone can get a signed-in account, so POS rules that let in *any* signed-in user (for example the `notices` table) need tightening.
 
 ## Deploying
 
@@ -28,7 +33,7 @@ The folder is a static site with no server code. It is served by GitHub Pages fr
 
 ## Install on iPhone
 
-Open the site in Safari → Share → **Add to Home Screen**. Sign in once; it stays signed in.
+Open the site in Safari → Share → **Add to Home Screen**. Create an account or sign in once; it stays signed in.
 
 ## Development
 

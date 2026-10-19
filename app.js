@@ -113,40 +113,89 @@
     photoUrls: {},
     sold: [],   // items sold on the day being edited: [{name, qty, amount(cents)}]
     reportScope: 'all',
+    isOwner: false,
   };
 
   $('today').textContent = fmtDay(localDate());
   $('closeDate').value = localDate();
   $('reportMonth').value = localDate().slice(0, 7);
 
-  // ── auth ───────────────────────────────────────────────────────────────
+  // ── auth: sign in, sign up, wait for approval ──────────────────────────
   let started = false;
+  const showView = (name) => { for (const v of ['loginView', 'pendingView', 'appView']) $(v).hidden = v !== name; };
+
   async function showForSession(session) {
-    if (!session) {
-      $('appView').hidden = true; $('loginView').hidden = false; started = false;
-      return;
-    }
-    const { data: ok } = await sb.rpc('is_ledger_member');
+    if (!session) { showView('loginView'); started = false; return; }
+    const { data: ok, error } = await sb.rpc('is_ledger_member');
+    if (error) { $('loginMsg').innerHTML = `<div class="note bad">Could not check your access. Check your connection and try again.</div>`; showView('loginView'); return; }
     if (!ok) {
-      $('loginMsg').innerHTML = `<div class="note bad">This account has not been given access yet. Ask the owner to add your email to the ledger.</div>`;
-      await sb.auth.signOut();
+      // New account: ask to join (once) and wait for an owner to approve
+      await sb.rpc('ledger_request_access', { p_name: session.user.user_metadata?.name || '' });
+      $('pendingText').textContent = `Your account ${session.user.email} is created. The owner needs to approve it in Settings → People before you can see the ledger.`;
+      showView('pendingView');
       return;
     }
-    $('whoami').textContent = `Signed in as ${session.user.email}`;
-    $('loginView').hidden = true; $('appView').hidden = false;
+    const { data: owner } = await sb.rpc('is_ledger_owner');
+    S.isOwner = !!owner;
+    $('whoami').textContent = `Signed in as ${session.user.email}${S.isOwner ? ' (owner)' : ''}`;
+    $('peopleCard').hidden = !S.isOwner;
+    showView('appView');
     if (!started) { started = true; await refreshAll(); }
   }
 
+  let loginMode = 'in';
+  function setLoginMode(mode) {
+    loginMode = mode;
+    const up = mode === 'up';
+    $('nameField').hidden = !up;
+    $('loginIntro').textContent = up ? 'Create an account. The owner approves it before you can see the ledger.' : 'Sign in to your account.';
+    $('loginBtn').textContent = up ? 'Create account' : 'Sign in';
+    $('loginToggle').textContent = up ? 'I already have an account' : 'Create an account';
+    $('loginPass').autocomplete = up ? 'new-password' : 'current-password';
+    $('loginMsg').innerHTML = '';
+  }
+  $('loginToggle').addEventListener('click', () => setLoginMode(loginMode === 'in' ? 'up' : 'in'));
+
   $('loginForm').addEventListener('submit', async (e) => {
     e.preventDefault();
-    const btn = $('loginBtn'); btn.disabled = true; btn.textContent = 'Signing in…';
+    const email = $('loginEmail').value.trim();
+    const password = $('loginPass').value;
+    const btn = $('loginBtn'); btn.disabled = true;
     $('loginMsg').innerHTML = '';
-    const { data, error } = await sb.auth.signInWithPassword({ email: $('loginEmail').value.trim(), password: $('loginPass').value });
-    btn.disabled = false; btn.textContent = 'Sign in';
-    if (error) { $('loginMsg').innerHTML = `<div class="note bad">Wrong email or password. Please try again.</div>`; return; }
-    await showForSession(data.session);
+    try {
+      if (loginMode === 'up') {
+        btn.textContent = 'Creating account…';
+        const { data, error } = await sb.auth.signUp({
+          email, password,
+          options: { data: { name: $('signupName').value.trim() }, emailRedirectTo: location.origin + location.pathname },
+        });
+        if (error) {
+          $('loginMsg').innerHTML = `<div class="note bad">${error.status === 422 || /registered/i.test(error.message) ? 'An account with this email already exists. Sign in instead.' : esc(error.message)}</div>`;
+          return;
+        }
+        if (data.session) { await showForSession(data.session); return; }
+        setLoginMode('in');
+        $('loginMsg').innerHTML = `<div class="note info">Almost done. We sent a confirmation link to <b>${esc(email)}</b>. Open it, then sign in here.</div>`;
+      } else {
+        btn.textContent = 'Signing in…';
+        const { data, error } = await sb.auth.signInWithPassword({ email, password });
+        if (error) {
+          $('loginMsg').innerHTML = `<div class="note bad">${/confirm/i.test(error.message) ? 'Please open the confirmation link we emailed you first, then sign in.' : 'Wrong email or password. Please try again.'}</div>`;
+          return;
+        }
+        await showForSession(data.session);
+      }
+    } finally {
+      btn.disabled = false; btn.textContent = loginMode === 'up' ? 'Create account' : 'Sign in';
+    }
   });
   $('signOut').addEventListener('click', async () => { await sb.auth.signOut(); showForSession(null); });
+  $('pendingSignOut').addEventListener('click', async () => { await sb.auth.signOut(); showForSession(null); });
+  $('pendingCheck').addEventListener('click', async () => {
+    const { data } = await sb.auth.getSession();
+    await showForSession(data.session);
+    if (!$('pendingView').hidden) toast('Not approved yet');
+  });
   sb.auth.onAuthStateChange((event) => { if (event === 'SIGNED_OUT') showForSession(null); });
   sb.auth.getSession().then(({ data }) => showForSession(data.session));
 
@@ -162,6 +211,7 @@
         renderOutlets(); renderClose(); renderStock(); renderDishList(); renderRecipes();
         if (!$('tab-report').hidden) loadReport();
         $('statusNote').innerHTML = '';
+        loadPeople();
       } catch (e) {
         console.error(e);
         $('statusNote').innerHTML = `<div class="note warn">No connection. What you see may be out of date; it updates when you are back online.</div>`;
@@ -1018,6 +1068,52 @@
     a.download = `stall-ledger-${month}.csv`;
     document.body.append(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  });
+
+  // ── people (owners only) ───────────────────────────────────────────────
+  let pendingCount = 0;
+  async function loadPeople() {
+    if (!S.isOwner) return;
+    try {
+      const [reqs, members] = await Promise.all([
+        must(await sb.from('ledger_join_requests').select('*').order('created_at')),
+        must(await sb.from('ledger_members').select('*').order('created_at')),
+      ]);
+      pendingCount = reqs.length;
+      const me = (await sb.auth.getUser()).data.user?.email?.toLowerCase();
+      $('peopleRequests').innerHTML = reqs.length ? `<div class="note warn"><b>Waiting to join</b>${reqs.map(r => `
+        <div class="row" style="margin-top:8px">
+          <div class="grow"><div><b>${esc(r.name || r.email)}</b></div>${r.name ? `<div class="muted">${esc(r.email)}</div>` : ''}</div>
+          <button class="btn small" type="button" data-decline="${esc(r.email)}">Decline</button>
+          <button class="btn small primary" type="button" data-approve="${esc(r.email)}">Approve</button>
+        </div>`).join('')}</div>` : `<div class="muted">No one is waiting to join. New people can create an account on the sign-in page, then show up here.</div>`;
+      $('peopleMembers').innerHTML = members.map(m => `
+        <div class="it">
+          <div class="main"><div class="title">${esc(m.email)}${m.email.toLowerCase() === me ? ' <span class="muted">(you)</span>' : ''}</div></div>
+          <span class="pill ${m.role === 'owner' ? 'ok' : ''}">${m.role === 'owner' ? 'Owner' : 'Staff'}</span>
+          ${m.email.toLowerCase() === me ? '' : `<button class="btn small danger" type="button" data-remove-member="${esc(m.email)}">Remove</button>`}
+        </div>`).join('');
+      renderOwnerNudge();
+    } catch (e) { console.error(e); $('peopleRequests').innerHTML = `<div class="note warn">Could not load people.</div>`; }
+  }
+  function renderOwnerNudge() {
+    const el = $('statusNote');
+    if (!S.isOwner || !pendingCount) { el.querySelector('[data-people-nudge]')?.remove(); return; }
+    if (el.querySelector('[data-people-nudge]')) return;
+    el.insertAdjacentHTML('beforeend', `<div class="note info" data-people-nudge>${plural(pendingCount, 'person is', 'people are')} waiting to join. <button class="btn small" type="button" data-go-people>Review</button></div>`);
+    el.querySelector('[data-go-people]').onclick = () => { showTab('settings'); $('peopleCard').scrollIntoView({ block: 'start' }); };
+  }
+  $('peopleCard').addEventListener('click', async e => {
+    const b = e.target.closest('button'); if (!b) return;
+    try {
+      if (b.dataset.approve) { await must(await sb.rpc('ledger_decide_request', { p_email: b.dataset.approve, p_approve: true })); toast('Approved. They can open the ledger now.'); }
+      else if (b.dataset.decline) { await must(await sb.rpc('ledger_decide_request', { p_email: b.dataset.decline, p_approve: false })); toast('Request declined'); }
+      else if (b.dataset.removeMember) {
+        if (b.dataset.armed !== '1') { b.dataset.armed = '1'; b.textContent = 'Tap to confirm'; return; }
+        await must(await sb.rpc('ledger_set_member', { p_email: b.dataset.removeMember, p_role: null })); toast('Removed');
+      } else return;
+      loadPeople();
+    } catch (err) { console.error(err); toast('Could not update. Please try again.'); }
   });
 
   // ── settings ───────────────────────────────────────────────────────────

@@ -211,12 +211,23 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
 <div class="login" id="loginView" hidden>
   <form id="loginForm">
     <h1>Stall Ledger</h1>
-    <div class="muted">Sign in with the email and password the owner gave you.</div>
+    <div class="muted" id="loginIntro">Sign in to your account.</div>
+    <label class="f" id="nameField" hidden>Your name<input id="signupName" autocomplete="name" maxlength="60" placeholder="So the owner knows who you are"></label>
     <label class="f">Email<input id="loginEmail" type="email" autocomplete="username" required></label>
-    <label class="f">Password<input id="loginPass" type="password" autocomplete="current-password" required></label>
+    <label class="f">Password<input id="loginPass" type="password" autocomplete="current-password" minlength="6" required></label>
     <div id="loginMsg"></div>
     <button class="btn primary block" id="loginBtn" type="submit">Sign in</button>
+    <button class="btn block" id="loginToggle" type="button">Create an account</button>
   </form>
+</div>
+
+<div class="login" id="pendingView" hidden>
+  <div style="width:100%;max-width:360px;display:flex;flex-direction:column;gap:12px">
+    <h1>Waiting for approval</h1>
+    <div class="muted" id="pendingText">Your account is created. The owner needs to approve it before you can see the ledger.</div>
+    <button class="btn primary block" id="pendingCheck" type="button">Check again</button>
+    <button class="btn block" id="pendingSignOut" type="button">Sign out</button>
+  </div>
 </div>
 
 <div id="appView" hidden>
@@ -324,6 +335,11 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
           <span class="grow"></span>
           <button class="btn small primary" id="saveOutlets">Save names</button>
         </div>
+      </div>
+      <div class="card" id="peopleCard" hidden>
+        <h3>People</h3>
+        <div id="peopleRequests"></div>
+        <div class="list" id="peopleMembers"></div>
       </div>
       <div class="card">
         <h3>Account</h3>
