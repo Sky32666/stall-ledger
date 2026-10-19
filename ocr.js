@@ -22,6 +22,10 @@
   const TOTAL_KEYS = ['NET SALES', 'NETT SALES', 'NET SALE', 'TOTAL NET', 'NET TOTAL', 'TOTAL SALES', 'GRAND TOTAL',
     'TOTAL COLLECTION', 'TOTAL COLLECTED', 'TOTAL PAYMENT', 'SALES TOTAL', 'TOTAL'];
 
+  // Summary lines that look like "<name> <count> <amount>" but are not dishes
+  const HEADER_WORDS = ['SALES', 'ITEMS', 'ITEM SOLD', 'QTY', 'SUBTOTAL', 'SUB TOTAL', 'GROSS', 'NET', 'AMOUNT',
+    'TRANS', 'TXN', 'BILLS', 'RECEIPT', 'ORDERS', 'GUEST', 'PAX', 'DEPARTMENT', 'CATEGORY', 'Z REPORT', 'X REPORT'];
+
   const ORDER_KEYS = ['NO. OF TRANS', 'NO OF TRANS', 'TRANSACTION', 'TRANS COUNT', 'TXN', 'RECEIPTS', 'RECEIPT COUNT',
     'NO. OF BILLS', 'NO OF BILLS', 'BILLS', 'ORDERS', 'CHECKS', 'GUEST'];
 
@@ -37,7 +41,7 @@
   function amountsIn(line) {
     const fixed = line
       .replace(/(\d)[oO](?=\d|[.,]\d)/g, '$10')       // 1O5.00 → 105.00
-      .replace(/(\d)\s+(?=\d{3}[.,]\d{2}\b)/g, '$1')    // 1 234.50 → 1234.50
+      .replace(/(\$\s?\d{1,3})\s+(?=\d{3}[.,]\d{2}\b)/g, '$1') // $1 234.50 → $1234.50 (only after $, so "23 207.00" stays qty + amount)
       .replace(/(\d),(\d{2})\b(?![.,]\d)/g, '$1.$2');  // 85,00 → 85.00
     const out = [];
     const re = /(-)?\s?(?:S?\$\s?)?(\d{1,3}(?:,\d{3})+|\d+)\.(\d{2})\b/g;
@@ -65,6 +69,26 @@
     return line.includes(key);
   }
 
+  // "CHICKEN CHOP 23 207.00", "2 X FISH & CHIPS 19.80", "PASTA X5 @8.50 42.50"
+  // A line is an item only when it has a quantity as well as an amount, so
+  // payment lines like "CASH 520.00" never match.
+  function parseItem(line, cents) {
+    let rest = line.replace(/\s*-?\s?(?:S?\$\s?)?(\d{1,3}(?:,\d{3})+|\d+)[.,]\d{2}\s*$/, '');
+    if (rest === line) return null;
+    rest = rest.replace(/\s*[@X×*]\s*(?:S?\$\s?)?\d+[.,]\d{2}\s*$/, '');   // unit price
+    let qty = null, name = null, m;
+    if ((m = rest.match(/^(\d{1,4})\s*[X×*]?\s+(.+)$/))) { qty = +m[1]; name = m[2]; }
+    else if ((m = rest.match(/^(.+?)\s+[X×*]?\s*(\d{1,4})$/))) { name = m[1]; qty = +m[2]; }
+    if (!qty || !name) return null;
+    name = wordsOf(name).replace(/[^A-Z0-9&'()\/ +-]/g, ' ').replace(/\s+/g, ' ').trim();
+    if ((name.match(/[A-Z]/g) || []).length < 3 || name.length > 40) return null;
+    return { name: titleCase(name), qty, amount: cents };
+  }
+
+  function titleCase(s) {
+    return s.toLowerCase().replace(/(^|[\s(&\/-])([a-z])/g, (_, a, b) => a + b.toUpperCase());
+  }
+
   function findDate(lines) {
     for (const raw of lines) {
       const line = raw.replace(/(?<=\d)[oO]|[oO](?=\d)/g, '0');
@@ -89,6 +113,7 @@
   /**
    * @param {string} text OCR output
    * @returns {{ total: number|null, pay: {cash?,card?,paynow?,delivery?}, orders: number|null,
+   *             items: Array<{name: string, qty: number, amount: number}>,
    *             date: string|null, matched: Array<{line: string, field: string, cents?: number}> }}
    *          amounts in cents
    */
@@ -96,6 +121,7 @@
     const lines = String(text || '').split(/\r?\n/).map(normalize).filter(Boolean);
     const pay = {};
     const matched = [];
+    const items = [];
     let total = null, totalRank = Infinity, orders = null;
 
     for (const line of lines) {
@@ -119,9 +145,15 @@
         // "CASH TOTAL 85.00" is the cash line, not the day's total
         pay[cat[0]] = (pay[cat[0]] || 0) + cents;
         matched.push({ line, field: cat[0], cents });
-      } else if (rank >= 0 && rank < totalRank) {
-        total = cents; totalRank = rank;
-        matched.push({ line, field: 'total', cents });
+      } else if (rank >= 0) {
+        if (rank < totalRank) { total = cents; totalRank = rank; matched.push({ line, field: 'total', cents }); }
+      } else if (!HEADER_WORDS.some(k => hasKey(words, k))) {
+        const item = parseItem(line, cents);
+        if (item) {
+          const same = items.find(i => i.name === item.name);
+          if (same) { same.qty += item.qty; same.amount += item.amount; } else items.push(item);
+          matched.push({ line, field: 'item', cents });
+        }
       }
     }
 
@@ -132,7 +164,7 @@
     // No explicit total but payments found: use their sum
     if (total == null && paySum > 0) total = paySum;
 
-    return { total, pay, orders, date: findDate(lines), matched };
+    return { total, pay, orders, items, date: findDate(lines), matched };
   }
 
   const api = { parseReport, amountsIn, findDate };

@@ -1,38 +1,39 @@
-# 档口账本
+# Stall Ledger
 
-档口每日收档记账、库存和月报（损益表）的手机网页。可以在 iPhone Safari「添加到主屏幕」，像 App 一样使用。
+A phone-first web app for a hawker stall: daily close, item sales, stock and a monthly profit & loss. On iPhone, open it in Safari and use **Add to Home Screen** to run it like an app.
 
-- **记账**：拍 POS 日结单，手机上免费识别文字（Tesseract.js，不用 API key），自动填总额、现金、NETS、PayNow、外卖平台和单数，检查后保存。照片会一起存档。
-- **库存**：进货（数量、总价、供应商）、盘点、报废，快没货时提醒。
-- **月报**：营业额 − 食材进货 = 毛利，再减去租金、人工、水电等开支得到净利；有每日明细、星期分析、付款方式、供应商排名，可以导出 CSV 用 Excel 打开。
+- **Close**: photograph the POS end-of-day (Z) report. The phone reads it for free with Tesseract.js (no API key) and fills in total sales, cash, NETS/card, PayNow/QR, delivery apps, order count and, if the report lists them, items sold. Check the numbers and save; the photo is kept with the day.
+- **Items sold**: quantity and sales per dish for each day, typed in or read from the report. Dish names and prices are remembered for next time.
+- **Stock**: stock in (quantity, total price, supplier), counts and write-offs, with low-stock alerts.
+- **Report**: sales − food purchases = gross profit, minus rent, wages, utilities and other expenses = net profit. Also item sales ranking, daily sales, best days of the week, payment mix and purchases by supplier. Export to CSV for Excel or the accountant.
 
-数据存在 Supabase（表名都以 `ledger_` 开头，跟 POS 的表分开），只有加进白名单的邮箱能登录。
+Data is stored in Supabase in tables prefixed `ledger_`, separate from the POS tables. Only emails on the allow-list can sign in and see anything.
 
-## 一次性设置（Supabase）
+## One-time setup (Supabase)
 
-1. **建表**：Supabase → SQL Editor → 贴上 [`supabase/migrations/20261021_stall_ledger.sql`](supabase/migrations/20261021_stall_ledger.sql) 全部内容 → Run。
-2. **关掉公开注册**：Authentication → Sign In / Providers → Email → 关闭 *Allow new users to sign up*。（就算没关，没在白名单里的人也看不到任何数据。）
-3. **加用户**：Authentication → Users → *Add user* → *Create new user*，填邮箱和密码，勾选 *Auto Confirm User*。
-4. **加进白名单**：SQL Editor 运行
+1. **Create the tables**: Supabase → SQL Editor → paste all of [`supabase/migrations/20261021_stall_ledger.sql`](supabase/migrations/20261021_stall_ledger.sql) → Run. The script is safe to run again after an update.
+2. **Turn off public sign-up**: Authentication → Sign In / Providers → Email → turn off *Allow new users to sign up*. (Even if left on, people not on the allow-list see no data.)
+3. **Add a user**: Authentication → Users → *Add user* → *Create new user*, enter email and password, tick *Auto Confirm User*.
+4. **Add them to the allow-list**: in SQL Editor run
    ```sql
-   insert into ledger_members (email) values ('姐姐的邮箱@example.com');
+   insert into ledger_members (email) values ('sister@example.com');
    ```
 
-## 部署
+## Deploying
 
-整个文件夹是静态网站（没有服务器代码），放到任何静态托管都可以，例如 GitHub Pages、Vercel、Cloudflare Pages。必须用 **https**，否则「添加到主屏幕」和离线功能不能用。
+The folder is a static site with no server code. It is served by GitHub Pages from this repo; any static host works. It must be served over **https** for Add to Home Screen and offline loading.
 
-`config.js` 里只有 Supabase 的 URL 和 **anon key**（本来就是公开的）。**绝对不要**放 service_role key。
+`config.js` holds only the Supabase URL and the **publishable (anon) key**, which is public by design. **Never** put the service_role key in it.
 
-## iPhone 安装
+## Install on iPhone
 
-用 Safari 打开网址 → 分享按钮 → **添加到主屏幕**。第一次打开时登录一次，之后会记住。
+Open the site in Safari → Share → **Add to Home Screen**. Sign in once; it stays signed in.
 
-## 开发
+## Development
 
 ```bash
-python3 -m http.server 8766 --directory stall-ledger
-node --test stall-ledger/tests
+python3 -m http.server 8766
+node --test tests
 ```
 
-日结单的识别规则在 [`ocr.js`](ocr.js)。如果你的 POS 日结单用的字眼不一样（例如 "Nett Amt"），在 `TOTAL_KEYS` 或 `CATEGORIES` 里加关键字，然后在 `tests/ocr.test.mjs` 加一个例子。
+Report reading rules live in [`ocr.js`](ocr.js). If your POS prints different words (for example "Nett Amt"), add them to `TOTAL_KEYS` or `CATEGORIES` and add an example to `tests/ocr.test.mjs`.

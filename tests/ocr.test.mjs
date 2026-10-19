@@ -79,8 +79,35 @@ test('dates', () => {
   assert.equal(findDate(['nothing here']), null);
 });
 
+test('item sales lines', () => {
+  const r = parseReport(`
+    Z REPORT  18/10/2026
+    ITEM SALES
+    CHICKEN CHOP          23     207.00
+    2 X FISH & CHIPS              19.80
+    AGLIO OLIO X5 @8.50           42.50
+    Chicken Chop           1       9.00
+    ITEMS SOLD            31     278.30
+    NET SALES                    278.30
+    CASH                         278.30
+  `);
+  assert.deepEqual(r.items, [
+    { name: 'Chicken Chop', qty: 24, amount: 21600 },
+    { name: 'Fish & Chips', qty: 2, amount: 1980 },
+    { name: 'Aglio Olio', qty: 5, amount: 4250 },
+  ]);
+  assert.equal(r.total, 27830);
+  assert.deepEqual(r.pay, { cash: 27830 });
+});
+
+test('payment and summary lines are not items', () => {
+  const r = parseReport('NO. OF TRANS 87\nCASH 520.00\nNETS 3 410.00\nGST 9% 107.34\nGROSS SALES 12 99.00');
+  assert.deepEqual(r.items, []);
+});
+
 test('empty text', () => {
   const r = parseReport('');
   assert.equal(r.total, null);
   assert.deepEqual(r.pay, {});
+  assert.deepEqual(r.items, []);
 });

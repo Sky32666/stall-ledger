@@ -1,9 +1,10 @@
 -- ─────────────────────────────────────────────────────────────────────────────
--- 档口账本 (stall ledger): daily closings, stock, monthly P&L.
+-- Stall Ledger: daily closings, item sales, stock, monthly P&L.
 -- Separate from the POS tables (all prefixed ledger_). Only signed-in users
 -- whose email is in ledger_members can read or write anything.
 --
--- Run once in Supabase → SQL Editor. Then add each person:
+-- Run in Supabase → SQL Editor. Safe to run again after updates (every
+-- statement is idempotent). Then add each person:
 --   1. Authentication → Users → Add user (email + password, auto-confirm)
 --   2. insert into ledger_members (email) values ('sister@example.com');
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -57,11 +58,13 @@ CREATE TABLE IF NOT EXISTS ledger_closings (
   updated_by UUID DEFAULT auth.uid()
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_closings_date ON ledger_closings (date DESC);
+-- Per-item sales for the day: [{name, qty, amount}] (amount in cents)
+ALTER TABLE ledger_closings ADD COLUMN IF NOT EXISTS items_sold JSONB NOT NULL DEFAULT '[]'::jsonb;
 
 CREATE TABLE IF NOT EXISTS ledger_items (
   id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name       TEXT NOT NULL,
-  unit       TEXT NOT NULL DEFAULT '个',
+  unit       TEXT NOT NULL DEFAULT 'pcs',
   category   TEXT,
   low        NUMERIC,                              -- alert when qty <= low
   qty        JSONB NOT NULL DEFAULT '{}'::jsonb,   -- {outlet_id: quantity}
@@ -177,5 +180,5 @@ CREATE POLICY ledger_photos_insert ON storage.objects
 
 -- Starting settings: one stall; add the second one later in the app's Settings tab
 INSERT INTO ledger_settings (id, data)
-VALUES ('main', '{"outlets":[{"id":"a","name":"档口 1"}]}'::jsonb)
+VALUES ('main', '{"outlets":[{"id":"a","name":"Stall 1"}]}'::jsonb)
 ON CONFLICT (id) DO NOTHING;

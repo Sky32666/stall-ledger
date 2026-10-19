@@ -1,4 +1,4 @@
-// 档口账本 — daily close, stock and monthly P&L for a hawker stall.
+// Stall Ledger — daily close, item sales, stock and monthly P&L for a hawker stall.
 // Data lives in Supabase (tables ledger_*, bucket ledger-photos); receipts are
 // read on the phone with Tesseract.js (free, no API key), then parsed by ocr.js.
 (() => {
@@ -18,11 +18,15 @@
   const fixed = (c) => c == null ? '' : (c / 100).toFixed(2);
   const pad = (n) => String(n).padStart(2, '0');
   const localDate = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   const fmtDay = (iso) => {
     const d = new Date(iso + 'T00:00:00');
-    return `${d.getMonth() + 1}月${d.getDate()}日 周${'日一二三四五六'[d.getDay()]}`;
+    return `${DOW[d.getDay()]} ${d.getDate()} ${MON[d.getMonth()]}`;
   };
+  const fmtMonth = (m) => { const [y, mo] = m.split('-').map(Number); return `${MON[mo - 1]} ${y}`; };
   const qtyFmt = (q) => (Math.round((Number(q) || 0) * 100) / 100).toString();
+  const plural = (n, one, many = one + 's') => `${n} ${n === 1 ? one : many}`;
   const lsGet = (k, d) => { try { return localStorage.getItem(k) ?? d; } catch { return d; } };
   const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
 
@@ -33,11 +37,14 @@
     setTimeout(() => el.remove(), 2800);
   }
 
-  const PAY = [['cash', '现金'], ['card', 'NETS/刷卡'], ['paynow', 'PayNow/QR'], ['delivery', '外卖平台'], ['other', '其他']];
-  const MOVE_TYPES = { in: '进货', count: '盘点', waste: '报废' };
+  const PAY = [['cash', 'Cash'], ['card', 'NETS/card'], ['paynow', 'PayNow/QR'], ['delivery', 'Delivery apps'], ['other', 'Other']];
+  const MOVE_TYPES = { in: 'Stock in', count: 'Count', waste: 'Write-off' };
 
   // ── data layer (Supabase) ──────────────────────────────────────────────
-  const fromClosing = (r) => ({ id: r.id, date: r.date, outletId: r.outlet_id, total: r.total, pay: r.pay || {}, orders: r.orders, note: r.note, photoPath: r.photo_path });
+  const fromClosing = (r) => ({
+    id: r.id, date: r.date, outletId: r.outlet_id, total: r.total, pay: r.pay || {}, orders: r.orders,
+    note: r.note, photoPath: r.photo_path, sold: Array.isArray(r.items_sold) ? r.items_sold : [],
+  });
   const fromItem = (r) => ({ id: r.id, name: r.name, unit: r.unit, category: r.category, low: r.low == null ? null : Number(r.low), qty: r.qty || {}, active: r.active });
   const fromMove = (r) => ({ id: r.id, itemId: r.item_id, itemName: r.item_name, unit: r.unit, outletId: r.outlet_id, type: r.type, qty: Number(r.qty), before: Number(r.before), after: Number(r.after), cost: r.cost, supplier: r.supplier, note: r.note, date: r.date, createdAt: r.created_at });
   const fromExpense = (r) => ({ id: r.id, month: r.month, outletId: r.outlet_id, lines: r.lines || {}, note: r.note });
@@ -50,7 +57,7 @@
     async saveClosing(c) {
       must(await sb.from('ledger_closings').upsert({
         id: c.id, date: c.date, outlet_id: c.outletId, total: c.total, pay: c.pay, orders: c.orders,
-        note: c.note, photo_path: c.photoPath, updated_at: new Date().toISOString(),
+        note: c.note, photo_path: c.photoPath, items_sold: c.sold, updated_at: new Date().toISOString(),
       }));
     },
     async items() { return must(await sb.from('ledger_items').select('*').order('name')).map(fromItem); },
@@ -90,11 +97,12 @@
 
   // ── state ──────────────────────────────────────────────────────────────
   const S = {
-    outlets: [{ id: 'a', name: '档口 1' }],
+    outlets: [{ id: 'a', name: 'Stall 1' }],
     outlet: lsGet('ledger.outlet', 'a'),
     closings: [], items: [], moves: [],
     photoBlob: null, photoPath: null, photoUploading: null,
     photoUrls: {},
+    sold: [],   // items sold on the day being edited: [{name, qty, amount(cents)}]
     reportScope: 'all',
   };
 
@@ -111,26 +119,26 @@
     }
     const { data: ok } = await sb.rpc('is_ledger_member');
     if (!ok) {
-      $('loginMsg').innerHTML = `<div class="note bad">这个账号还没有开通。请联系老板把你的邮箱加进账本。</div>`;
+      $('loginMsg').innerHTML = `<div class="note bad">This account has not been given access yet. Ask the owner to add your email to the ledger.</div>`;
       await sb.auth.signOut();
       return;
     }
-    $('whoami').textContent = `已登录：${session.user.email}`;
+    $('whoami').textContent = `Signed in as ${session.user.email}`;
     $('loginView').hidden = true; $('appView').hidden = false;
     if (!started) { started = true; await refreshAll(); }
   }
 
   $('loginForm').addEventListener('submit', async (e) => {
     e.preventDefault();
-    const btn = $('loginBtn'); btn.disabled = true; btn.textContent = '登录中…';
+    const btn = $('loginBtn'); btn.disabled = true; btn.textContent = 'Signing in…';
     $('loginMsg').innerHTML = '';
     const { data, error } = await sb.auth.signInWithPassword({ email: $('loginEmail').value.trim(), password: $('loginPass').value });
-    btn.disabled = false; btn.textContent = '登录';
-    if (error) { $('loginMsg').innerHTML = `<div class="note bad">邮箱或密码不对，请再试一次。</div>`; return; }
+    btn.disabled = false; btn.textContent = 'Sign in';
+    if (error) { $('loginMsg').innerHTML = `<div class="note bad">Wrong email or password. Please try again.</div>`; return; }
     await showForSession(data.session);
   });
   $('signOut').addEventListener('click', async () => { await sb.auth.signOut(); showForSession(null); });
-  sb.auth.onAuthStateChange((event, session) => { if (event === 'SIGNED_OUT') showForSession(null); });
+  sb.auth.onAuthStateChange((event) => { if (event === 'SIGNED_OUT') showForSession(null); });
   sb.auth.getSession().then(({ data }) => showForSession(data.session));
 
   // ── loading / refresh ──────────────────────────────────────────────────
@@ -142,12 +150,12 @@
         const [settings, closings, items, moves] = await Promise.all([api.settings(), api.closings(), api.items(), api.moves()]);
         if (Array.isArray(settings?.outlets) && settings.outlets.length) S.outlets = settings.outlets.map(o => ({ id: String(o.id), name: String(o.name) }));
         S.closings = closings; S.items = items; S.moves = moves;
-        renderOutlets(); renderClose(); renderStock();
+        renderOutlets(); renderClose(); renderStock(); renderDishList();
         if (!$('tab-report').hidden) loadReport();
         $('statusNote').innerHTML = '';
       } catch (e) {
         console.error(e);
-        $('statusNote').innerHTML = `<div class="note warn">连不上网络，显示的可能不是最新的。有网时会自动更新。</div>`;
+        $('statusNote').innerHTML = `<div class="note warn">No connection. What you see may be out of date; it updates when you are back online.</div>`;
       } finally { refreshing = null; }
     })();
     return refreshing;
@@ -170,7 +178,7 @@
   document.querySelectorAll('nav.tabs button').forEach(b => b.addEventListener('click', () => showTab(b.dataset.tab)));
   showTab(lsGet('ledger.tab', 'close'));
 
-  // ── outlets ────────────────────────────────────────────────────────────
+  // ── stalls ─────────────────────────────────────────────────────────────
   const outletName = (id) => S.outlets.find(o => o.id === id)?.name || id;
   function renderOutlets() {
     if (!S.outlets.some(o => o.id === S.outlet)) S.outlet = S.outlets[0]?.id;
@@ -180,10 +188,10 @@
     if (!multi) S.reportScope = 'all';
     $('outletSeg').innerHTML = S.outlets.map(o =>
       `<button data-id="${esc(o.id)}" aria-pressed="${o.id === S.outlet}">${esc(o.name)}</button>`).join('');
-    $('reportScope').innerHTML = [{ id: 'all', name: '全部档口' }, ...S.outlets].map(o =>
+    $('reportScope').innerHTML = [{ id: 'all', name: 'All stalls' }, ...S.outlets].map(o =>
       `<button data-id="${esc(o.id)}" aria-pressed="${o.id === S.reportScope}">${esc(o.name)}</button>`).join('');
     $('outletEdit').innerHTML = S.outlets.map((o, i) =>
-      `<label class="f">档口 ${i + 1}<input id="outlet-name-${esc(o.id)}" data-id="${esc(o.id)}" value="${esc(o.name)}" maxlength="30"></label>`).join('');
+      `<label class="f">Stall ${i + 1}<input id="outlet-name-${esc(o.id)}" data-id="${esc(o.id)}" value="${esc(o.name)}" maxlength="30"></label>`).join('');
   }
   $('outletSeg').addEventListener('click', e => {
     const b = e.target.closest('button'); if (!b) return;
@@ -205,28 +213,93 @@
     const total = toCents(F.total.value);
     const sum = PAY.reduce((a, [k]) => a + (toCents(F[k].value) || 0), 0);
     const el = $('sumCheck');
-    if (total == null && sum === 0) { el.innerHTML = ''; return; }
-    if (sum === 0) { el.innerHTML = `<div class="muted">付款方式可以不填，只填总额也行。</div>`; return; }
-    const diff = (total || 0) - sum;
-    el.innerHTML = Math.abs(diff) < 1
-      ? `<div class="sumline"><span class="muted">付款加起来</span><span class="num" style="color:var(--good)">${money(sum)} ✓ 对得上</span></div>`
-      : `<div class="note warn">付款加起来是 <b class="num">${money(sum)}</b>，跟总额差 <b class="num">${money(Math.abs(diff))}</b>，再对一下。</div>`;
+    if (total == null && sum === 0) { el.innerHTML = ''; }
+    else if (sum === 0) { el.innerHTML = `<div class="muted">Payments are optional; the total alone is fine.</div>`; }
+    else {
+      const diff = (total || 0) - sum;
+      el.innerHTML = Math.abs(diff) < 1
+        ? `<div class="sumline"><span class="muted">Payments add up to</span><span class="num" style="color:var(--good)">${money(sum)} ✓ matches</span></div>`
+        : `<div class="note warn">Payments add up to <b class="num">${money(sum)}</b>, which is <b class="num">${money(Math.abs(diff))}</b> ${diff > 0 ? 'less' : 'more'} than the total. Please check.</div>`;
+    }
+    checkSold();
   }
   Object.values(F).forEach(inp => inp.addEventListener('input', checkSum));
+
+  // Items sold
+  function renderSold() {
+    $('soldRows').innerHTML = S.sold.map((it, i) => `
+      <div class="sold-row" data-i="${i}">
+        <input id="sold-name-${i}" data-f="name" list="dish-list" value="${esc(it.name)}" placeholder="Dish, e.g. Chicken Chop" aria-label="Dish name">
+        <div class="sold-nums">
+          <label>Qty<input id="sold-qty-${i}" data-f="qty" class="money" inputmode="numeric" value="${it.qty ?? ''}" placeholder="0"></label>
+          <label>S$<input id="sold-amt-${i}" data-f="amount" class="money" inputmode="decimal" value="${fixed(it.amount)}" placeholder="0.00"></label>
+          <button class="icon-btn" data-remove type="button" aria-label="Remove dish">×</button>
+        </div>
+      </div>`).join('');
+    checkSold();
+  }
+  function checkSold() {
+    const el = $('soldCheck');
+    const sum = S.sold.reduce((a, it) => a + (it.amount || 0), 0);
+    const total = toCents(F.total.value);
+    if (!S.sold.length || !sum) { el.innerHTML = ''; return; }
+    const share = total ? Math.round(sum / total * 100) : null;
+    el.innerHTML = `<div class="sumline"><span class="muted">${plural(S.sold.reduce((a, it) => a + (it.qty || 0), 0), 'item')} sold</span>
+      <span class="num">${money(sum)}${share != null ? ` · ${share}% of total` : ''}</span></div>`;
+  }
+  $('addSold').addEventListener('click', () => {
+    S.sold.push({ name: '', qty: null, amount: null });
+    renderSold();
+    $('sold-name-' + (S.sold.length - 1))?.focus();
+  });
+  $('soldRows').addEventListener('input', e => {
+    const row = e.target.closest('.sold-row'); if (!row) return;
+    const it = S.sold[+row.dataset.i]; const f = e.target.dataset.f;
+    if (f === 'name') it.name = e.target.value;
+    else if (f === 'qty') { const n = parseInt(e.target.value, 10); it.qty = Number.isFinite(n) ? n : null; }
+    else if (f === 'amount') it.amount = toCents(e.target.value);
+    // Typing a known dish with a qty: fill the amount from its usual price
+    if ((f === 'name' || f === 'qty') && it.qty && it.amount == null) {
+      const price = dishPrices()[it.name.trim().toLowerCase()];
+      if (price) { it.amount = price * it.qty; row.querySelector('[data-f=amount]').value = fixed(it.amount); }
+    }
+    checkSold();
+  });
+  $('soldRows').addEventListener('click', e => {
+    if (!e.target.closest('[data-remove]')) return;
+    S.sold.splice(+e.target.closest('.sold-row').dataset.i, 1);
+    renderSold();
+  });
+  // Dish names and their latest unit price, from earlier days
+  function dishPrices() {
+    const out = {};
+    for (const c of S.closings) for (const it of c.sold) {
+      const k = String(it.name).toLowerCase();
+      if (!(k in out) && it.qty > 0 && it.amount > 0) out[k] = Math.round(it.amount / it.qty);
+    }
+    return out;
+  }
+  function renderDishList() {
+    const names = new Map();
+    for (const c of S.closings) for (const it of c.sold) if (it.name && !names.has(it.name.toLowerCase())) names.set(it.name.toLowerCase(), it.name);
+    $('dish-list').innerHTML = [...names.values()].slice(0, 100).map(n => `<option value="${esc(n)}">`).join('');
+  }
 
   function fillForm(c) {
     F.total.value = fixed(c?.total); F.orders.value = c?.orders ?? '';
     for (const [k] of PAY) F[k].value = fixed(c?.pay?.[k]);
     F.note.value = c?.note || '';
+    S.sold = (c?.sold || []).map(it => ({ ...it }));
+    renderSold();
     checkSum();
   }
 
   function renderClose() {
     const ex = existingClose();
     $('overwriteNote').innerHTML = ex
-      ? `<div class="note info">${esc(outletName(S.outlet))} ${fmtDay($('closeDate').value)} 已经记过（${money(ex.total)}）。再保存会更新这一笔。</div>`
+      ? `<div class="note info">${esc(outletName(S.outlet))} ${fmtDay($('closeDate').value)} is already recorded (${money(ex.total)}). Saving again updates it.</div>`
       : '';
-    $('saveClose').textContent = ex ? '更新这一天的账' : '保存这一天的账';
+    $('saveClose').textContent = ex ? 'Update this day' : 'Save this day';
     renderRecent();
   }
   $('closeDate').addEventListener('change', () => { const ex = existingClose(); if (ex) fillForm(ex); renderClose(); });
@@ -234,27 +307,34 @@
   async function renderRecent() {
     const rows = S.closings.filter(c => c.outletId === S.outlet).slice(0, 14);
     if (!rows.length) {
-      $('recentClosings').innerHTML = `<div class="empty">还没有 ${esc(outletName(S.outlet))} 的记录。收档后拍日结单，第一笔就会出现在这里。</div>`;
+      $('recentClosings').innerHTML = `<div class="empty">Nothing recorded for ${esc(outletName(S.outlet))} yet. After closing, photograph the Z report and the first day shows up here.</div>`;
       return;
     }
     const need = rows.map(r => r.photoPath).filter(p => p && !S.photoUrls[p]);
     if (need.length) { try { Object.assign(S.photoUrls, await api.photoUrls(need)); } catch {} }
-    $('recentClosings').innerHTML = rows.map(c => `
+    $('recentClosings').innerHTML = rows.map(c => {
+      const bits = [];
+      if (c.orders) bits.push(plural(c.orders, 'order'));
+      const pays = PAY.filter(([k]) => c.pay?.[k]).map(([k, n]) => `${n} ${fixed(c.pay[k])}`);
+      bits.push(pays.length ? pays.join(' · ') : 'total only');
+      if (c.sold.length) bits.push(plural(c.sold.length, 'dish', 'dishes'));
+      return `
       <div class="it clickable" data-id="${esc(c.id)}">
-        ${c.photoPath && S.photoUrls[c.photoPath] ? `<a href="${esc(S.photoUrls[c.photoPath])}" target="_blank" rel="noopener" data-photo><img class="thumb" src="${esc(S.photoUrls[c.photoPath])}" alt="日结单照片" loading="lazy"></a>` : `<span class="thumb"></span>`}
+        ${c.photoPath && S.photoUrls[c.photoPath] ? `<a href="${esc(S.photoUrls[c.photoPath])}" target="_blank" rel="noopener" data-photo><img class="thumb" src="${esc(S.photoUrls[c.photoPath])}" alt="Z report photo" loading="lazy"></a>` : `<span class="thumb"></span>`}
         <div class="main">
           <div class="title">${fmtDay(c.date)}</div>
-          <div class="muted">${c.orders ? c.orders + ' 单 · ' : ''}${PAY.filter(([k]) => c.pay?.[k]).map(([k, n]) => n + ' ' + fixed(c.pay[k])).join(' · ') || '只记总额'}</div>
+          <div class="muted">${bits.join(' · ')}</div>
         </div>
         <div class="amt">${money(c.total)}</div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
   }
   $('recentClosings').addEventListener('click', e => {
     if (e.target.closest('[data-photo]')) return; // open the photo instead
     const it = e.target.closest('.it'); if (!it) return;
     const c = S.closings.find(x => x.id === it.dataset.id); if (!c) return;
     $('closeDate').value = c.date; fillForm(c); renderClose(); window.scrollTo(0, 0);
-    toast('已载入，可以修改后再保存');
+    toast('Loaded. Edit and save again to update.');
   });
 
   // Photo → shrink → upload + read text on the phone
@@ -263,7 +343,7 @@
       const url = URL.createObjectURL(file);
       const img = new Image();
       img.onload = () => resolve(img);
-      img.onerror = () => reject(new Error('无法读取这张照片'));
+      img.onerror = () => reject(new Error('This photo could not be opened'));
       img.src = url;
     });
   }
@@ -283,7 +363,7 @@
     S.photoPath = null;
     const prev = $('photoPrev');
     prev.src = URL.createObjectURL(file); prev.hidden = false;
-    $('photoHint').textContent = '换一张照片';
+    $('photoHint').textContent = 'Use a different photo';
     try {
       const img = await loadImage(file);
       const blob = await toJpeg(drawScaled(img, 1600));
@@ -291,7 +371,7 @@
       S.photoUploading = api.uploadPhoto(blob, closeId()).then(p => (S.photoPath = p)).catch(() => (S.photoPath = null));
       readReceipt(drawScaled(img, 2200));
     } catch (e) {
-      $('aiNote').innerHTML = `<div class="note warn">${esc(e.message)}，请照着单子手动填。</div>`;
+      $('aiNote').innerHTML = `<div class="note warn">${esc(e.message)}. Please type the numbers in.</div>`;
     }
   });
 
@@ -324,12 +404,12 @@
   async function readReceipt(canvas) {
     const run = ++ocrRun;
     const note = (html) => { if (run === ocrRun) $('aiNote').innerHTML = html; };
-    note(`<div class="note info"><span class="spin"></span> 正在读日结单…第一次要下载识别文件，会慢一点。</div>`);
+    note(`<div class="note info"><span class="spin"></span> Reading the report… the first time downloads the reader, so it takes a little longer.</div>`);
     try {
       await loadTesseract();
       const worker = await window.Tesseract.createWorker('eng', 1, {
         logger: m => {
-          if (m.status === 'recognizing text') note(`<div class="note info"><span class="spin"></span> 正在读日结单… ${Math.round(m.progress * 100)}%</div>`);
+          if (m.status === 'recognizing text') note(`<div class="note info"><span class="spin"></span> Reading the report… ${Math.round(m.progress * 100)}%</div>`);
         },
       });
       const { data } = await worker.recognize(prepForOcr(canvas));
@@ -337,31 +417,35 @@
       if (run !== ocrRun) return;
       const r = window.LedgerOCR.parseReport(data.text);
       const found = [];
-      if (r.total != null) { F.total.value = fixed(r.total); found.push('总额'); }
+      if (r.total != null) { F.total.value = fixed(r.total); found.push('total'); }
       for (const [k, n] of PAY) if (r.pay[k]) { F[k].value = fixed(r.pay[k]); found.push(n); }
-      if (r.orders != null) { F.orders.value = r.orders; found.push('单数'); }
+      if (r.orders != null) { F.orders.value = r.orders; found.push('orders'); }
+      if (r.items.length) { S.sold = r.items.map(it => ({ ...it })); renderSold(); found.push(plural(r.items.length, 'dish', 'dishes')); }
       checkSum();
-      const raw = `<details><summary class="muted">看识别出来的文字</summary><div class="ocr-raw">${esc(data.text.trim())}</div></details>`;
+      const raw = `<details><summary class="muted">Show the text that was read</summary><div class="ocr-raw">${esc(data.text.trim())}</div></details>`;
       if (!found.length) {
-        note(`<div class="note warn">照片读到了，但找不到金额。请照着单子手动填。拍的时候放平、光线亮一点会更准。</div>${raw}`);
+        note(`<div class="note warn">The photo was read but no amounts were found. Please type them in. A flat, well-lit photo works best.</div>${raw}`);
       } else if (r.date && r.date !== $('closeDate').value) {
-        note(`<div class="note warn">已填入：${found.join('、')}。单上的日期是 <b>${esc(r.date)}</b>，跟选的日期不一样。<button class="btn small" id="useOcrDate" type="button">改成 ${esc(r.date)}</button></div>${raw}`);
-        $('useOcrDate').onclick = () => { $('closeDate').value = r.date; renderClose(); toast('日期已改'); };
+        note(`<div class="note warn">Filled in: ${found.join(', ')}. The report is dated <b>${esc(fmtDay(r.date))}</b>, not the date selected. <button class="btn small" id="useOcrDate" type="button">Use ${esc(fmtDay(r.date))}</button></div>${raw}`);
+        $('useOcrDate').onclick = () => { $('closeDate').value = r.date; renderClose(); toast('Date changed'); };
       } else {
-        note(`<div class="note info">已填入：${found.join('、')}。<b>请对着单子检查一遍</b>再保存。</div>${raw}`);
+        note(`<div class="note info">Filled in: ${found.join(', ')}. <b>Check them against the report</b> before saving.</div>${raw}`);
       }
     } catch (e) {
       console.error(e);
-      note(`<div class="note warn">读不了这张单（可能没有网络），请手动填。照片仍会保存。</div>`);
+      note(`<div class="note warn">Could not read this report (maybe no internet). Please type the numbers in; the photo is still saved.</div>`);
     }
   }
 
   $('saveClose').addEventListener('click', async () => {
     const date = $('closeDate').value;
     const total = toCents(F.total.value);
-    if (!date) return toast('请选日期');
-    if (total == null || total < 0) { F.total.focus(); return toast('请填总营业额'); }
-    const btn = $('saveClose'); btn.disabled = true; btn.textContent = '保存中…';
+    if (!date) return toast('Choose a date');
+    if (total == null || total < 0) { F.total.focus(); return toast('Enter the total sales'); }
+    const sold = S.sold
+      .map(it => ({ name: String(it.name || '').trim().slice(0, 40), qty: it.qty || 0, amount: it.amount || 0 }))
+      .filter(it => it.name && (it.qty > 0 || it.amount > 0));
+    const btn = $('saveClose'); btn.disabled = true; btn.textContent = 'Saving…';
     try {
       if (S.photoUploading) await S.photoUploading;
       const prev = existingClose();
@@ -373,14 +457,15 @@
         orders: Number.isFinite(orders) ? orders : null,
         note: F.note.value.trim().slice(0, 200),
         photoPath: S.photoPath || prev?.photoPath || null,
+        sold,
       });
-      toast(`${outletName(S.outlet)} ${fmtDay(date)} 已保存：${money(total)}`);
+      toast(`${outletName(S.outlet)} ${fmtDay(date)} saved: ${money(total)}`);
       S.photoBlob = null; S.photoPath = null; S.photoUploading = null; ocrRun++;
-      $('photoPrev').hidden = true; $('aiNote').innerHTML = ''; $('photoHint').textContent = '拍 POS 打印的日结单，手机会自动读出数字';
+      $('photoPrev').hidden = true; $('aiNote').innerHTML = ''; $('photoHint').textContent = 'Take a photo of the POS end-of-day report. The phone reads the numbers for you.';
       fillForm(null);
       await refreshAll();
     } catch (e) {
-      console.error(e); toast('保存失败，请检查网络再试一次');
+      console.error(e); toast('Could not save. Check your connection and try again.');
     } finally {
       btn.disabled = false; renderClose();
     }
@@ -395,24 +480,25 @@
     return 'ok';
   };
   const LV_ORDER = { out: 0, low: 1, ok: 2 };
+  const LV_LABEL = { out: 'Out', low: 'Low', ok: 'OK' };
 
   function renderStock() {
     const term = $('stockSearch').value.trim().toLowerCase();
     const items = S.items.filter(i => i.active !== false && (!term || i.name.toLowerCase().includes(term)))
-      .sort((a, b) => (LV_ORDER[levelOf(a)] - LV_ORDER[levelOf(b)]) || a.name.localeCompare(b.name, 'zh'));
+      .sort((a, b) => (LV_ORDER[levelOf(a)] - LV_ORDER[levelOf(b)]) || a.name.localeCompare(b.name));
     const lows = S.items.filter(i => i.active !== false && levelOf(i) !== 'ok');
     $('lowSummary').innerHTML = lows.length
-      ? `<div class="note warn"><b>要补货：</b>${lows.map(i => esc(i.name)).join('、')}</div>`
-      : (S.items.length ? `<div class="note info">库存都够。</div>` : '');
+      ? `<div class="note warn"><b>Restock:</b> ${lows.map(i => esc(i.name)).join(', ')}</div>`
+      : (S.items.length ? `<div class="note info">Stock levels are fine.</div>` : '');
     $('stockList').innerHTML = items.length ? items.map(i => {
       const lv = levelOf(i);
       return `<div class="it clickable" data-id="${esc(i.id)}">
         <div class="main"><div class="title">${esc(i.name)}</div>
-          <div class="muted">${i.category ? esc(i.category) + ' · ' : ''}${i.low != null ? `少于 ${qtyFmt(i.low)} ${esc(i.unit)} 提醒` : '没设提醒'}</div></div>
-        <span class="pill ${lv}">${lv === 'out' ? '没货' : lv === 'low' ? '快没了' : '够'}</span>
+          <div class="muted">${i.category ? esc(i.category) + ' · ' : ''}${i.low != null ? `alert below ${qtyFmt(i.low)} ${esc(i.unit)}` : 'no alert set'}</div></div>
+        <span class="pill ${lv}">${LV_LABEL[lv]}</span>
         <div class="amt">${qtyFmt(qtyOf(i))} ${esc(i.unit)}</div>
       </div>`;
-    }).join('') : `<div class="empty">${S.items.length ? '找不到这个货品。' : '还没有货品。点「＋ 新货品」加鸡扒、薯条、意面这些主要食材。'}</div>`;
+    }).join('') : `<div class="empty">${S.items.length ? 'No item matches that search.' : 'No stock items yet. Tap “+ New item” to add chicken chops, fries, pasta and other main ingredients.'}</div>`;
 
     const moves = S.moves.filter(m => m.outletId === S.outlet).slice(0, 20);
     $('moveList').innerHTML = moves.length ? moves.map(m => `
@@ -420,8 +506,8 @@
         <span class="pill ${m.type === 'in' ? 'ok' : m.type === 'waste' ? 'out' : ''}">${MOVE_TYPES[m.type] || m.type}</span>
         <div class="main"><div class="title">${esc(m.itemName)}</div>
           <div class="muted">${fmtDay(m.date)}${m.supplier ? ' · ' + esc(m.supplier) : ''}${m.note ? ' · ' + esc(m.note) : ''}</div></div>
-        <div class="amt">${m.type === 'count' ? '剩 ' + qtyFmt(m.after) : (m.type === 'in' ? '+' : '−') + qtyFmt(m.qty)} ${esc(m.unit)}${m.cost ? '<div class="muted">' + money(m.cost) + '</div>' : ''}</div>
-      </div>`).join('') : `<div class="empty">进货、盘点、报废的记录会出现在这里。</div>`;
+        <div class="amt">${m.type === 'count' ? qtyFmt(m.after) + ' left' : (m.type === 'in' ? '+' : '−') + qtyFmt(m.qty)} ${esc(m.unit)}${m.cost ? '<div class="muted">' + money(m.cost) + '</div>' : ''}</div>
+      </div>`).join('') : `<div class="empty">Stock-ins, counts and write-offs show up here.</div>`;
   }
   $('stockSearch').addEventListener('input', renderStock);
 
@@ -438,38 +524,38 @@
 
   function editItem(item) {
     openSheet(`
-      <button class="btn small x" data-close type="button">关闭</button>
-      <h2>${item ? '修改货品' : '新货品'}</h2>
-      <label class="f">名称<input id="it-name" maxlength="40" placeholder="例如：鸡扒" value="${esc(item?.name || '')}"></label>
+      <button class="btn small x" data-close type="button">Close</button>
+      <h2>${item ? 'Edit item' : 'New item'}</h2>
+      <label class="f">Name<input id="it-name" maxlength="40" placeholder="e.g. Chicken chop" value="${esc(item?.name || '')}"></label>
       <div class="fields">
-        <label class="f">单位<input id="it-unit" maxlength="10" placeholder="块 / 包 / kg" value="${esc(item?.unit || '')}"></label>
-        <label class="f">少于多少提醒<input id="it-low" class="money" inputmode="decimal" placeholder="10" value="${item?.low ?? ''}"></label>
+        <label class="f">Unit<input id="it-unit" maxlength="10" placeholder="pcs / pack / kg" value="${esc(item?.unit || '')}"></label>
+        <label class="f">Alert when below<input id="it-low" class="money" inputmode="decimal" placeholder="10" value="${item?.low ?? ''}"></label>
       </div>
-      <label class="f">类别（可不填）<input id="it-cat" maxlength="20" placeholder="肉类 / 冷冻 / 酱料 / 包装" value="${esc(item?.category || '')}"></label>
-      ${item ? '' : `<label class="f">现在有多少<input id="it-qty" class="money" inputmode="decimal" placeholder="0"></label>`}
-      <button class="btn primary block" id="it-save" type="button">保存</button>
-      ${item ? `<button class="btn block danger" id="it-hide" type="button">不再使用这个货品</button>` : ''}
+      <label class="f">Category (optional)<input id="it-cat" maxlength="20" placeholder="Meat / Frozen / Sauce / Packaging" value="${esc(item?.category || '')}"></label>
+      ${item ? '' : `<label class="f">How many you have now<input id="it-qty" class="money" inputmode="decimal" placeholder="0"></label>`}
+      <button class="btn primary block" id="it-save" type="button">Save</button>
+      ${item ? `<button class="btn block danger" id="it-hide" type="button">Stop using this item</button>` : ''}
     `, (el, close) => {
       el.querySelector('#it-name').focus();
       el.querySelector('#it-save').onclick = async () => {
         const name = el.querySelector('#it-name').value.trim();
-        const unit = el.querySelector('#it-unit').value.trim() || '个';
+        const unit = el.querySelector('#it-unit').value.trim() || 'pcs';
         const low = parseFloat(el.querySelector('#it-low').value);
         const category = el.querySelector('#it-cat').value.trim() || null;
-        if (!name) return toast('请填名称');
+        if (!name) return toast('Enter a name');
         try {
           if (item) await api.updateItem(item.id, { name, unit, low: Number.isFinite(low) ? low : null, category });
           else {
             const q = parseFloat(el.querySelector('#it-qty').value);
             await api.addItem({ name, unit, low: Number.isFinite(low) ? low : null, category, qty: Number.isFinite(q) ? { [S.outlet]: q } : {} });
           }
-          close(); toast('已保存'); refreshAll();
-        } catch (e) { console.error(e); toast('保存失败'); }
+          close(); toast('Saved'); refreshAll();
+        } catch (e) { console.error(e); toast('Could not save'); }
       };
       const hide = el.querySelector('#it-hide');
       if (hide) hide.onclick = async () => {
-        if (hide.dataset.armed !== '1') { hide.dataset.armed = '1'; hide.textContent = '再按一次确认（以前的记录会保留）'; return; }
-        try { await api.updateItem(item.id, { active: false }); close(); toast('已隐藏'); refreshAll(); } catch { toast('失败'); }
+        if (hide.dataset.armed !== '1') { hide.dataset.armed = '1'; hide.textContent = 'Tap again to confirm (past records are kept)'; return; }
+        try { await api.updateItem(item.id, { active: false }); close(); toast('Item hidden'); refreshAll(); } catch { toast('Could not update'); }
       };
     });
   }
@@ -482,33 +568,35 @@
   function openMove(item) {
     let type = 'in';
     const suppliers = [...new Set(S.moves.map(m => m.supplier).filter(Boolean))].slice(0, 20);
+    const qtyLabel = { in: `How many came in (${item.unit})`, count: `How many are actually left (${item.unit})`, waste: `How many to write off (${item.unit})` };
+    const saveLabel = { in: 'Record stock in', count: 'Record count', waste: 'Record write-off' };
     openSheet(`
-      <div class="row"><h2 class="grow">${esc(item.name)}</h2><button class="btn small" data-close type="button">关闭</button></div>
-      <div class="muted">现在：<b class="num">${qtyFmt(qtyOf(item))} ${esc(item.unit)}</b></div>
+      <div class="row"><h2 class="grow">${esc(item.name)}</h2><button class="btn small" data-close type="button">Close</button></div>
+      <div class="muted">On hand: <b class="num">${qtyFmt(qtyOf(item))} ${esc(item.unit)}</b></div>
       <div class="typegrid" id="mv-types">
-        <button class="btn" data-t="in" aria-pressed="true" type="button">进货</button>
-        <button class="btn" data-t="count" aria-pressed="false" type="button">盘点</button>
-        <button class="btn" data-t="waste" aria-pressed="false" type="button">报废</button>
+        <button class="btn" data-t="in" aria-pressed="true" type="button">Stock in</button>
+        <button class="btn" data-t="count" aria-pressed="false" type="button">Count</button>
+        <button class="btn" data-t="waste" aria-pressed="false" type="button">Write-off</button>
       </div>
-      <label class="f"><span id="mv-qty-t">进了多少（${esc(item.unit)}）</span><input id="mv-qty" class="money" inputmode="decimal" placeholder="0"></label>
+      <label class="f"><span id="mv-qty-t">${esc(qtyLabel.in)}</span><input id="mv-qty" class="money" inputmode="decimal" placeholder="0"></label>
       <div class="fields" id="mv-in-fields">
-        <label class="f">总价 S$<input id="mv-cost" class="money" inputmode="decimal" placeholder="0.00"></label>
-        <label class="f">供应商<input id="mv-sup" maxlength="40" placeholder="例如：Sheng Siong" list="sup-list"></label>
+        <label class="f">Total price S$<input id="mv-cost" class="money" inputmode="decimal" placeholder="0.00"></label>
+        <label class="f">Supplier<input id="mv-sup" maxlength="40" placeholder="e.g. Sheng Siong" list="sup-list"></label>
       </div>
       <datalist id="sup-list">${suppliers.map(s => `<option value="${esc(s)}">`).join('')}</datalist>
-      <label class="f">日期<input id="mv-date" type="date" value="${localDate()}"></label>
-      <label class="f">备注（可不填）<input id="mv-note" maxlength="80"></label>
+      <label class="f">Date<input id="mv-date" type="date" value="${localDate()}"></label>
+      <label class="f">Note (optional)<input id="mv-note" maxlength="80"></label>
       <div id="mv-preview" class="muted"></div>
-      <button class="btn primary block" id="mv-save" type="button">记录进货</button>
-      <button class="btn block" id="mv-edit" type="button">修改货品资料</button>
+      <button class="btn primary block" id="mv-save" type="button">${saveLabel.in}</button>
+      <button class="btn block" id="mv-edit" type="button">Edit item details</button>
     `, (el, close) => {
       const qInp = el.querySelector('#mv-qty');
       const preview = () => {
         const q = parseFloat(qInp.value); const cur = qtyOf(item);
         if (!Number.isFinite(q)) { el.querySelector('#mv-preview').textContent = ''; return; }
         const after = type === 'in' ? cur + q : type === 'waste' ? cur - q : q;
-        const extra = type === 'count' ? `（${after <= cur ? '用掉' : '多出'} ${qtyFmt(Math.abs(cur - after))} ${item.unit}）` : '';
-        el.querySelector('#mv-preview').textContent = `保存后：${qtyFmt(after)} ${item.unit}${extra}`;
+        const extra = type === 'count' ? ` (${after <= cur ? 'used' : 'extra'} ${qtyFmt(Math.abs(cur - after))} ${item.unit})` : '';
+        el.querySelector('#mv-preview').textContent = `After saving: ${qtyFmt(after)} ${item.unit}${extra}`;
       };
       qInp.addEventListener('input', preview);
       el.querySelector('#mv-types').onclick = (e) => {
@@ -516,14 +604,14 @@
         type = b.dataset.t;
         el.querySelectorAll('#mv-types button').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
         el.querySelector('#mv-in-fields').hidden = type !== 'in';
-        el.querySelector('#mv-qty-t').textContent = { in: `进了多少（${item.unit}）`, count: `实际还剩多少（${item.unit}）`, waste: `报废多少（${item.unit}）` }[type];
-        el.querySelector('#mv-save').textContent = { in: '记录进货', count: '记录盘点', waste: '记录报废' }[type];
+        el.querySelector('#mv-qty-t').textContent = qtyLabel[type];
+        el.querySelector('#mv-save').textContent = saveLabel[type];
         preview();
       };
       el.querySelector('#mv-edit').onclick = () => editItem(item);
       el.querySelector('#mv-save').onclick = async () => {
         const q = parseFloat(qInp.value);
-        if (!Number.isFinite(q) || q < 0 || (type !== 'count' && q === 0)) { qInp.focus(); return toast('请填数量'); }
+        if (!Number.isFinite(q) || q < 0 || (type !== 'count' && q === 0)) { qInp.focus(); return toast('Enter a quantity'); }
         const btn = el.querySelector('#mv-save'); btn.disabled = true;
         try {
           const mv = await api.recordMove({
@@ -533,17 +621,17 @@
             note: el.querySelector('#mv-note').value.trim(),
             date: el.querySelector('#mv-date').value || localDate(),
           });
-          close(); toast(`${item.name}：${MOVE_TYPES[type]}已记录，现在 ${qtyFmt(mv.after)} ${item.unit}`);
+          close(); toast(`${item.name}: ${MOVE_TYPES[type].toLowerCase()} recorded, now ${qtyFmt(mv.after)} ${item.unit}`);
           refreshAll();
-        } catch (e) { console.error(e); btn.disabled = false; toast('记录失败，请再试'); }
+        } catch (e) { console.error(e); btn.disabled = false; toast('Could not record. Please try again.'); }
       };
     });
   }
 
   // ── monthly report (profit & loss) ─────────────────────────────────────
   const EXPENSES = [
-    ['rent', '租金'], ['wages', '人工 / CPF'], ['utilities', '水电'], ['gas', '煤气'],
-    ['commission', '外卖平台佣金'], ['misc', '清洁 / 杂费'],
+    ['rent', 'Rent'], ['wages', 'Wages / CPF'], ['utilities', 'Water & electricity'], ['gas', 'Gas'],
+    ['commission', 'Delivery app commission'], ['misc', 'Cleaning / misc'],
   ];
   function monthRange(m) {
     const [y, mo] = m.split('-').map(Number);
@@ -553,13 +641,25 @@
   const prevMonth = (m) => { const [y, mo] = m.split('-').map(Number); const d = new Date(y, mo - 2, 1); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`; };
   const pct = (a, b) => b ? Math.round(a / b * 1000) / 10 : null;
   const scopeOutlets = () => S.reportScope === 'all' ? S.outlets.map(o => o.id) : [S.reportScope];
-  const scopeLabel = () => S.reportScope === 'all' ? (S.outlets.length > 1 ? '全部档口' : outletName(S.outlets[0]?.id)) : outletName(S.reportScope);
+  const scopeLabel = () => S.reportScope === 'all' ? (S.outlets.length > 1 ? 'All stalls' : outletName(S.outlets[0]?.id)) : outletName(S.reportScope);
 
   async function fetchMonth(m) {
     const outs = new Set(scopeOutlets());
     const d = await api.month(m);
     const pick = (rows) => rows.filter(x => outs.has(x.outletId));
     return { closings: pick(d.closings), moves: pick(d.moves), expenses: pick(d.expenses) };
+  }
+
+  // Item sales across the days in a month, merged by name (case-insensitive)
+  function itemSales(closings) {
+    const by = new Map();
+    for (const c of closings) for (const it of c.sold) {
+      const k = String(it.name).trim().toLowerCase(); if (!k) continue;
+      const row = by.get(k) || { name: String(it.name).trim(), qty: 0, amount: 0, days: 0 };
+      row.qty += it.qty || 0; row.amount += it.amount || 0; row.days++;
+      by.set(k, row);
+    }
+    return [...by.values()].sort((a, b) => b.amount - a.amount || b.qty - a.qty);
   }
 
   function summarize(data) {
@@ -579,15 +679,15 @@
   async function loadReport() {
     const seq = ++reportSeq;
     const month = $('reportMonth').value || localDate().slice(0, 7);
-    $('reportBody').innerHTML = `<div class="empty"><span class="spin"></span> 计算中…</div>`;
+    $('reportBody').innerHTML = `<div class="empty"><span class="spin"></span> Working it out…</div>`;
     try {
       const [cur, prev] = await Promise.all([fetchMonth(month), fetchMonth(prevMonth(month))]);
       if (seq !== reportSeq) return;
-      lastReport = { month, data: cur, sum: summarize(cur), prev: summarize(prev) };
+      lastReport = { month, data: cur, sum: summarize(cur), prev: summarize(prev), items: itemSales(cur.closings), prevItems: itemSales(prev.closings) };
       renderReport();
     } catch (e) {
       console.error(e);
-      if (seq === reportSeq) $('reportBody').innerHTML = `<div class="note bad">读取月报失败，请检查网络再试。</div>`;
+      if (seq === reportSeq) $('reportBody').innerHTML = `<div class="note bad">Could not load the report. Check your connection and try again.</div>`;
     }
   }
   $('reportMonth').addEventListener('change', loadReport);
@@ -595,13 +695,13 @@
   function change(cur, prev) {
     if (!prev) return '';
     const d = Math.round((cur - prev) / Math.abs(prev) * 100);
-    if (!Number.isFinite(d) || d === 0) return `<span class="chg">与上月持平</span>`;
-    return `<span class="chg ${d > 0 ? 'up' : 'down'}">比上月 ${d > 0 ? '▲' : '▼'} ${Math.abs(d)}%</span>`;
+    if (!Number.isFinite(d) || d === 0) return `<span class="chg">same as last month</span>`;
+    return `<span class="chg ${d > 0 ? 'up' : 'down'}">${d > 0 ? '▲' : '▼'} ${Math.abs(d)}% vs last month</span>`;
   }
 
   function renderReport() {
-    const { month, data, sum, prev } = lastReport;
-    const { y, mo, dim } = monthRange(month);
+    const { month, data, sum, prev, items, prevItems } = lastReport;
+    const { dim } = monthRange(month);
     const thisMonth = localDate().slice(0, 7);
     const elapsed = month === thisMonth ? new Date().getDate() : month > thisMonth ? 0 : dim;
     const missing = [];
@@ -614,7 +714,7 @@
         date,
         total: cs.reduce((a, c) => a + (c.total || 0), 0),
         orders: cs.reduce((a, c) => a + (c.orders || 0), 0),
-        note: cs.map(c => c.note).filter(Boolean).join('；'),
+        note: cs.map(c => c.note).filter(Boolean).join('; '),
       });
     }
     const maxDay = Math.max(1, ...dayRows.map(r => r.total));
@@ -624,7 +724,7 @@
     const payTotals = PAY.map(([k, n]) => [k, n, data.closings.reduce((a, c) => a + (c.pay?.[k] || 0), 0)]).filter(([, , v]) => v > 0);
     const bySupplier = {}, byItem = {};
     for (const m of sum.buys) {
-      const s = m.supplier || '未填供应商';
+      const s = m.supplier || 'No supplier entered';
       bySupplier[s] = (bySupplier[s] || 0) + (m.cost || 0);
       byItem[m.itemName] = (byItem[m.itemName] || 0) + (m.cost || 0);
     }
@@ -632,12 +732,12 @@
     const sortDesc = (o) => Object.entries(o).sort((a, b) => b[1] - a[1]);
     const editable = S.reportScope !== 'all' || S.outlets.length === 1;
     const expBtn = editable
-      ? `<button class="btn" id="editExp" type="button">${sum.opex ? '修改这个月的开支' : '填写这个月的开支（租金、人工、水电…）'}</button>`
-      : `<div class="muted">要填开支，请先在上面选一个档口。</div>`;
+      ? `<button class="btn" id="editExp" type="button">${sum.opex ? 'Edit this month’s expenses' : 'Enter this month’s expenses (rent, wages, utilities…)'}</button>`
+      : `<div class="muted">To enter expenses, choose a stall above first.</div>`;
 
     $('exportBtn').hidden = false;
     if (!data.closings.length && !data.moves.length && !sum.opex) {
-      $('reportBody').innerHTML = `<div class="empty">${y}年${mo}月还没有记录。每天收档记账，这里会自动算出营业额、成本和利润。</div>${editable ? expBtn : ''}`;
+      $('reportBody').innerHTML = `<div class="empty">Nothing recorded for ${fmtMonth(month)} yet. Record each day after closing and this page works out sales, costs and profit.</div>${editable ? expBtn : ''}`;
       $('exportBtn').hidden = true;
       $('editExp')?.addEventListener('click', editExpenses);
       return;
@@ -646,66 +746,89 @@
     const line = (label, v, cls = '', extra = '') =>
       `<div class="pl-row ${cls}"><span>${label}${extra}</span><span class="num">${v < 0 ? '−' : ''}${money(Math.abs(v))}</span></div>`;
 
+    // Item sales
+    const itemDays = data.closings.filter(c => c.sold.length).length;
+    const itemTotal = items.reduce((a, it) => a + it.amount, 0);
+    const itemQty = items.reduce((a, it) => a + it.qty, 0);
+    const prevByName = new Map(prevItems.map(it => [it.name.toLowerCase(), it]));
+    const itemCard = items.length ? `<div class="card"><h3>Item sales</h3>
+      <div class="tbl-wrap"><table class="tbl">
+        <thead><tr><th>Item</th><th class="r">Qty</th><th class="r">Sales</th><th class="r">Share</th><th class="r">Avg price</th></tr></thead>
+        <tbody>${items.map(it => {
+          const p = prevByName.get(it.name.toLowerCase());
+          const d = p && p.qty ? Math.round((it.qty - p.qty) / p.qty * 100) : null;
+          return `<tr><td>${esc(it.name)}${d != null && d !== 0 ? `<div class="chg ${d > 0 ? 'up' : 'down'}" style="margin:0">${d > 0 ? '▲' : '▼'} ${Math.abs(d)}% qty</div>` : ''}</td>
+            <td class="r num">${it.qty}</td><td class="r num">${fixed(it.amount)}</td>
+            <td class="r num muted">${pct(it.amount, itemTotal)}%</td>
+            <td class="r num">${it.qty ? fixed(Math.round(it.amount / it.qty)) : ''}</td></tr>`;
+        }).join('')}</tbody>
+        <tfoot><tr><td>Total</td><td class="r num">${itemQty}</td><td class="r num">${fixed(itemTotal)}</td><td></td><td></td></tr></tfoot>
+      </table></div>
+      <div class="muted">Item sales were recorded on ${plural(itemDays, 'day')} of ${sum.days}.${sum.sales && itemDays === sum.days ? ` They cover ${pct(itemTotal, sum.sales)}% of total sales.` : ''}</div>
+    </div>` : (sum.days ? `<div class="card"><h3>Item sales</h3><div class="muted">No item sales recorded this month. Add them under “Items sold” when closing each day, or let the photo fill them in if your Z report lists items.</div></div>` : '');
+
     $('reportBody').innerHTML = `
       <div class="card">
-        <h3>损益表 · ${y}年${mo}月 · ${esc(scopeLabel())}</h3>
+        <h3>Profit &amp; loss · ${fmtMonth(month)} · ${esc(scopeLabel())}</h3>
         <div class="pl">
-          ${line('营业额', sum.sales, 'head', change(sum.sales, prev.sales))}
-          ${line('减：食材进货', -sum.cogs, 'sub', sum.sales ? ` <span class="muted">（${pct(sum.cogs, sum.sales)}%）</span>` : '')}
-          ${line('毛利', sum.gross, 'total', sum.sales ? ` <span class="muted">毛利率 ${pct(sum.gross, sum.sales)}%</span>` : '')}
-          ${EXPENSES.filter(([k]) => sum.exp[k]).map(([k, n]) => line('减：' + n, -sum.exp[k], 'sub')).join('')}
-          ${sum.opex ? '' : `<div class="pl-row sub"><span class="muted">还没填这个月的开支</span><span></span></div>`}
-          ${line('净利', sum.net, 'net ' + (sum.net < 0 ? 'neg' : ''), change(sum.net, prev.net))}
+          ${line('Sales', sum.sales, 'head', change(sum.sales, prev.sales))}
+          ${line('Less: food purchases', -sum.cogs, 'sub', sum.sales ? ` <span class="muted">(${pct(sum.cogs, sum.sales)}%)</span>` : '')}
+          ${line('Gross profit', sum.gross, 'total', sum.sales ? ` <span class="muted">margin ${pct(sum.gross, sum.sales)}%</span>` : '')}
+          ${EXPENSES.filter(([k]) => sum.exp[k]).map(([k, n]) => line('Less: ' + n, -sum.exp[k], 'sub')).join('')}
+          ${sum.opex ? '' : `<div class="pl-row sub"><span class="muted">No expenses entered for this month yet</span><span></span></div>`}
+          ${line('Net profit', sum.net, 'net ' + (sum.net < 0 ? 'neg' : ''), change(sum.net, prev.net))}
         </div>
         ${expBtn}
-        <div class="muted">食材成本按这个月记录的进货计算。月初、月底库存差别大时，利润会有偏差。</div>
+        <div class="muted">Food cost uses the stock-ins recorded this month. If stock on hand is very different at the start and end of the month, profit will be off by that much.</div>
       </div>
 
       <div class="kpis">
-        <div class="kpi"><div class="k">营业天数</div><div class="v">${sum.days}<span class="unit"> / ${elapsed} 天</span></div>
-          <div class="s">${missing.length ? `${missing.length} 天没记录` : '每天都有记录'}</div></div>
-        <div class="kpi"><div class="k">日均营业额</div><div class="v">${money(sum.days ? Math.round(sum.sales / sum.days) : 0)}</div>
+        <div class="kpi"><div class="k">Days open</div><div class="v">${sum.days}<span class="unit"> / ${elapsed}</span></div>
+          <div class="s">${missing.length ? `${plural(missing.length, 'day')} not recorded` : 'Every day recorded'}</div></div>
+        <div class="kpi"><div class="k">Average per day</div><div class="v">${money(sum.days ? Math.round(sum.sales / sum.days) : 0)}</div>
           <div class="s">${change(sum.days ? sum.sales / sum.days : 0, prev.days ? prev.sales / prev.days : 0)}</div></div>
-        <div class="kpi"><div class="k">单数</div><div class="v">${sum.orders || '—'}</div>
-          <div class="s">${sum.orders ? '平均每单 ' + money(Math.round(sum.sales / sum.orders)) : '日结单没有单数'}</div></div>
-        <div class="kpi"><div class="k">报废</div><div class="v">${wastes.length}<span class="unit"> 次</span></div>
-          <div class="s">${wastes.length ? wastes.slice(0, 3).map(w => esc(w.itemName)).join('、') : '没有报废'}</div></div>
+        <div class="kpi"><div class="k">Orders</div><div class="v">${sum.orders || '—'}</div>
+          <div class="s">${sum.orders ? 'average ' + money(Math.round(sum.sales / sum.orders)) + ' each' : 'no order counts entered'}</div></div>
+        <div class="kpi"><div class="k">Write-offs</div><div class="v">${wastes.length}</div>
+          <div class="s">${wastes.length ? wastes.slice(0, 3).map(w => esc(w.itemName)).join(', ') : 'none'}</div></div>
       </div>
 
-      ${missing.length && sum.days ? `<div class="note warn">这些日子没有记录：${missing.map(d => mo + '/' + d).join('、')}。休息日不用理；有开档的话记得补记。</div>` : ''}
+      ${missing.length && sum.days ? `<div class="note warn">No record for: ${missing.map(d => `${d} ${MON[+month.slice(5) - 1]}`).join(', ')}. Ignore rest days; if the stall was open, add them.</div>` : ''}
+
+      ${itemCard}
 
       <div class="card">
-        <h3>每日营业额</h3>
-        <div class="daybars" role="img" aria-label="每日营业额柱状图">${Array.from({ length: dim }, (_, i) => {
+        <h3>Daily sales</h3>
+        <div class="daybars" role="img" aria-label="Daily sales bar chart">${Array.from({ length: dim }, (_, i) => {
           const r = dayRows.find(x => x.date === `${month}-${pad(i + 1)}`);
-          return `<span class="${r ? '' : 'empty'}" style="height:${r ? Math.max(4, r.total / maxDay * 100) : 4}%" title="${i + 1}日 ${r ? money(r.total) : '没记录'}"></span>`;
+          return `<span class="${r ? '' : 'none'}" style="height:${r ? Math.max(4, r.total / maxDay * 100) : 4}%" title="${i + 1} ${MON[+month.slice(5) - 1]}: ${r ? money(r.total) : 'no record'}"></span>`;
         }).join('')}</div>
         <div class="axis"><span>1</span><span>${Math.ceil(dim / 2)}</span><span>${dim}</span></div>
         <div class="tbl-wrap"><table class="tbl">
-          <thead><tr><th>日期</th><th class="r">营业额</th><th class="r">单数</th><th class="r">平均每单</th></tr></thead>
+          <thead><tr><th>Date</th><th class="r">Sales</th><th class="r">Orders</th><th class="r">Per order</th></tr></thead>
           <tbody>${dayRows.map(r => `<tr><td>${fmtDay(r.date)}${r.note ? `<div class="muted">${esc(r.note)}</div>` : ''}</td>
             <td class="r num">${fixed(r.total)}</td><td class="r num">${r.orders || ''}</td>
             <td class="r num">${r.orders ? fixed(Math.round(r.total / r.orders)) : ''}</td></tr>`).join('')}</tbody>
-          <tfoot><tr><td>合计</td><td class="r num">${fixed(sum.sales)}</td><td class="r num">${sum.orders || ''}</td><td></td></tr></tfoot>
+          <tfoot><tr><td>Total</td><td class="r num">${fixed(sum.sales)}</td><td class="r num">${sum.orders || ''}</td><td></td></tr></tfoot>
         </table></div>
       </div>
 
-      ${dayRows.length >= 7 ? `<div class="card"><h3>星期几生意最好</h3>
+      ${dayRows.length >= 7 ? `<div class="card"><h3>Best days of the week</h3>
         ${[1, 2, 3, 4, 5, 6, 0].map(w => {
           const b = byWeekday[w]; const avg = b.n ? Math.round(b.sum / b.n) : 0;
-          return `<div class="wk"><span>周${'日一二三四五六'[w]}</span><div class="bar"><span style="width:${avg / wkTop * 100}%"></span></div><span class="num">${b.n ? fixed(avg) : '—'}</span></div>`;
-        }).join('')}<div class="muted">按有记录的日子算平均。</div></div>` : ''}
+          return `<div class="wk"><span>${DOW[w]}</span><div class="bar"><span style="width:${avg / wkTop * 100}%"></span></div><span class="num">${b.n ? fixed(avg) : '—'}</span></div>`;
+        }).join('')}<div class="muted">Average sales on days with a record.</div></div>` : ''}
 
-      ${payTotals.length ? `<div class="card"><h3>付款方式</h3><div class="tbl-wrap"><table class="tbl"><tbody>
+      ${payTotals.length ? `<div class="card"><h3>Payments</h3><div class="tbl-wrap"><table class="tbl"><tbody>
         ${payTotals.map(([, n, v]) => `<tr><td>${n}</td><td class="r num">${fixed(v)}</td><td class="r num muted">${pct(v, sum.sales)}%</td></tr>`).join('')}
         </tbody></table></div>
-        ${payTotals.some(([k]) => k === 'cash') ? `<div class="muted">现金 ${money(payTotals.find(([k]) => k === 'cash')[2])} 应该跟这个月存进银行的现金对得上。</div>` : ''}</div>` : ''}
+        ${payTotals.some(([k]) => k === 'cash') ? `<div class="muted">Cash of ${money(payTotals.find(([k]) => k === 'cash')[2])} should match the cash banked this month.</div>` : ''}</div>` : ''}
 
-      ${sum.buys.length ? `<div class="card"><h3>进货</h3>
-        <div class="tbl-wrap"><table class="tbl"><thead><tr><th>供应商</th><th class="r">金额</th><th class="r">占比</th></tr></thead><tbody>
+      ${sum.buys.length ? `<div class="card"><h3>Purchases</h3>
+        <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Supplier</th><th class="r">Amount</th><th class="r">Share</th></tr></thead><tbody>
           ${sortDesc(bySupplier).map(([n, v]) => `<tr><td>${esc(n)}</td><td class="r num">${fixed(v)}</td><td class="r num muted">${pct(v, sum.cogs)}%</td></tr>`).join('')}
         </tbody></table></div>
-        <div class="tbl-wrap"><table class="tbl"><thead><tr><th>货品</th><th class="r">金额</th><th class="r">占营业额</th></tr></thead><tbody>
+        <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Stock item</th><th class="r">Amount</th><th class="r">% of sales</th></tr></thead><tbody>
           ${sortDesc(byItem).slice(0, 10).map(([n, v]) => `<tr><td>${esc(n)}</td><td class="r num">${fixed(v)}</td><td class="r num muted">${sum.sales ? pct(v, sum.sales) + '%' : ''}</td></tr>`).join('')}
         </tbody></table></div></div>` : ''}
     `;
@@ -716,71 +839,74 @@
     const month = lastReport?.month || $('reportMonth').value;
     const outletId = S.reportScope === 'all' ? S.outlets[0].id : S.reportScope;
     const existing = lastReport?.data.expenses.find(e => e.outletId === outletId);
-    const { y, mo } = monthRange(month);
     openSheet(`
-      <div class="row"><h2 class="grow">${y}年${mo}月 开支</h2><button class="btn small" data-close type="button">关闭</button></div>
-      <div class="muted">${esc(outletName(outletId))} · 填这个月实际付的钱，没有的留空。</div>
+      <div class="row"><h2 class="grow">Expenses · ${fmtMonth(month)}</h2><button class="btn small" data-close type="button">Close</button></div>
+      <div class="muted">${esc(outletName(outletId))} · enter what was actually paid this month; leave blank if none.</div>
       <div class="fields">${EXPENSES.map(([k, n]) =>
         `<label class="f">${n} S$<input class="money" id="exp-${k}" inputmode="decimal" placeholder="0.00" value="${fixed(existing?.lines?.[k] || null)}"></label>`).join('')}</div>
-      <label class="f">备注<input id="exp-note" maxlength="120" placeholder="例如：人工包括 2 个帮手" value="${esc(existing?.note || '')}"></label>
-      <button class="btn primary block" id="exp-save" type="button">保存开支</button>
-      <button class="btn block" id="exp-copy" type="button">照上个月的开支填</button>
+      <label class="f">Note<input id="exp-note" maxlength="120" placeholder="e.g. wages include 2 helpers" value="${esc(existing?.note || '')}"></label>
+      <button class="btn primary block" id="exp-save" type="button">Save expenses</button>
+      <button class="btn block" id="exp-copy" type="button">Copy last month’s amounts</button>
     `, (el, close) => {
       el.querySelector('#exp-copy').onclick = async () => {
         try {
           const prev = await api.expense(`${prevMonth(month)}_${outletId}`);
-          if (!prev) return toast('上个月没有填开支');
+          if (!prev) return toast('No expenses entered last month');
           for (const [k] of EXPENSES) el.querySelector('#exp-' + k).value = fixed(prev.lines[k] || null);
-          toast('已填入上个月的数字，记得检查');
-        } catch { toast('读取失败'); }
+          toast('Copied last month’s amounts. Check them before saving.');
+        } catch { toast('Could not load last month'); }
       };
       el.querySelector('#exp-save').onclick = async () => {
         const lines = {};
         for (const [k] of EXPENSES) { const v = toCents(el.querySelector('#exp-' + k).value); if (v) lines[k] = v; }
         try {
           await api.saveExpense({ id: `${month}_${outletId}`, month, outletId, lines, note: el.querySelector('#exp-note').value.trim() });
-          close(); toast('开支已保存'); loadReport();
-        } catch (e) { console.error(e); toast('保存失败'); }
+          close(); toast('Expenses saved'); loadReport();
+        } catch (e) { console.error(e); toast('Could not save'); }
       };
     });
   }
 
   $('exportBtn').addEventListener('click', () => {
     if (!lastReport) return;
-    const { month, data, sum } = lastReport;
+    const { month, data, sum, items } = lastReport;
     const q = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
     const row = (...cells) => cells.map(q).join(',');
-    const L = [row(`月报 ${month}`, scopeLabel())];
-    L.push('', row('损益表', '金额 (S$)'));
-    L.push(row('营业额', fixed(sum.sales)), row('食材进货', fixed(sum.cogs)), row('毛利', fixed(sum.gross)));
+    const L = [row(`Monthly report ${month}`, scopeLabel())];
+    L.push('', row('Profit & loss', 'Amount (S$)'));
+    L.push(row('Sales', fixed(sum.sales)), row('Food purchases', fixed(sum.cogs)), row('Gross profit', fixed(sum.gross)));
     for (const [k, n] of EXPENSES) if (sum.exp[k]) L.push(row(n, fixed(sum.exp[k])));
-    L.push(row('开支合计', fixed(sum.opex)), row('净利', fixed(sum.net)));
-    L.push('', row('日期', '档口', '营业额', ...PAY.map(([, n]) => n), '单数', '备注'));
+    L.push(row('Total expenses', fixed(sum.opex)), row('Net profit', fixed(sum.net)));
+    if (items.length) {
+      L.push('', row('Item', 'Qty', 'Sales (S$)', 'Avg price (S$)'));
+      for (const it of items) L.push(row(it.name, it.qty, fixed(it.amount), it.qty ? fixed(Math.round(it.amount / it.qty)) : ''));
+    }
+    L.push('', row('Date', 'Stall', 'Sales', ...PAY.map(([, n]) => n), 'Orders', 'Note'));
     for (const c of [...data.closings].sort((a, b) => a.date.localeCompare(b.date)))
       L.push(row(c.date, outletName(c.outletId), fixed(c.total), ...PAY.map(([k]) => fixed(c.pay?.[k])), c.orders ?? '', c.note));
-    L.push('', row('日期', '档口', '类型', '货品', '数量', '金额', '供应商', '备注'));
+    L.push('', row('Date', 'Stall', 'Type', 'Stock item', 'Quantity', 'Amount', 'Supplier', 'Note'));
     for (const m of [...data.moves].sort((a, b) => a.date.localeCompare(b.date)))
       L.push(row(m.date, outletName(m.outletId), MOVE_TYPES[m.type], m.itemName, `${qtyFmt(m.type === 'count' ? m.after : m.qty)} ${m.unit}`, m.cost ? fixed(m.cost) : '', m.supplier, m.note));
     const blob = new Blob(['﻿' + L.join('\n')], { type: 'text/csv;charset=utf-8' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `月报-${month}.csv`;
+    a.download = `stall-ledger-${month}.csv`;
     document.body.append(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   });
 
   // ── settings ───────────────────────────────────────────────────────────
   $('addOutlet').addEventListener('click', () => {
-    S.outlets.push({ id: 'o' + Date.now().toString(36), name: `档口 ${S.outlets.length + 1}` });
+    S.outlets.push({ id: 'o' + Date.now().toString(36), name: `Stall ${S.outlets.length + 1}` });
     renderOutlets();
-    toast('加好了，改名字后按「保存名称」');
+    toast('Added. Rename it, then tap “Save names”.');
   });
   $('saveOutlets').addEventListener('click', async () => {
     document.querySelectorAll('#outletEdit input').forEach(inp => {
       const o = S.outlets.find(x => x.id === inp.dataset.id);
       if (o) o.name = inp.value.trim() || o.name;
     });
-    try { await api.saveSettings({ outlets: S.outlets }); toast('档口已保存'); } catch { toast('保存失败'); }
+    try { await api.saveSettings({ outlets: S.outlets }); toast('Stalls saved'); } catch { toast('Could not save'); }
     renderOutlets(); renderClose(); renderStock();
   });
 
